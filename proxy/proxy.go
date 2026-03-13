@@ -608,7 +608,9 @@ func (p *SNIProxy) handleConnection(clientConn net.Conn) {
 		tunnel.count--
 		if tunnel.count == 0 {
 			tunnel.cancel()
-			delete(p.activeTunnels, hostname)
+			if p.activeTunnels[hostname] == tunnel {
+				delete(p.activeTunnels, hostname)
+			}
 		}
 		p.activeTunnelsLock.Unlock()
 	}()
