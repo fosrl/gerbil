@@ -14,7 +14,6 @@ import (
 	"strconv"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"time"
 
 	"github.com/fosrl/gerbil/logger"
@@ -76,7 +75,7 @@ type SNIProxy struct {
 type activeTunnel struct {
 	ctx    context.Context
 	cancel context.CancelFunc
-	count  atomic.Int64
+	count  int // protected by activeTunnelsLock
 }
 
 // readOnlyConn is a wrapper for io.Reader that implements net.Conn
@@ -600,21 +599,18 @@ func (p *SNIProxy) handleConnection(clientConn net.Conn) {
 		tunnel = &activeTunnel{ctx: ctx, cancel: cancel}
 		p.activeTunnels[hostname] = tunnel
 	}
-	tunnel.count.Add(1)
+	tunnel.count++
 	tunnelCtx := tunnel.ctx
 	p.activeTunnelsLock.Unlock()
 
 	defer func() {
-		// Decrement count atomically; if we're the last connection, clean up
-		if tunnel.count.Add(-1) == 0 {
+		p.activeTunnelsLock.Lock()
+		tunnel.count--
+		if tunnel.count == 0 {
 			tunnel.cancel()
-			p.activeTunnelsLock.Lock()
-			// Only delete if the map still points to our tunnel
-			if p.activeTunnels[hostname] == tunnel {
-				delete(p.activeTunnels, hostname)
-			}
-			p.activeTunnelsLock.Unlock()
+			delete(p.activeTunnels, hostname)
 		}
+		p.activeTunnelsLock.Unlock()
 	}()
 
 	// Start bidirectional data transfer with tunnel context
