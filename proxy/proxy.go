@@ -755,10 +755,10 @@ func (p *SNIProxy) selectStickyEndpoint(clientAddr string, endpoints []string) s
 
 // pipe handles bidirectional data transfer between connections
 func (p *SNIProxy) pipe(ctx context.Context, clientConn, targetConn net.Conn, clientReader io.Reader) {
-	g, ctx := errgroup.WithContext(ctx)
+	g, gCtx := errgroup.WithContext(ctx)
 
 	// Close connections when context cancels to unblock io.Copy operations
-	context.AfterFunc(ctx, func() {
+	context.AfterFunc(gCtx, func() {
 		clientConn.Close()
 		targetConn.Close()
 	})
