@@ -13,7 +13,7 @@ import (
 	"github.com/fosrl/gerbil/logger"
 )
 
-type TCPRelayRegistrationMessage struct {
+type WssRelayRegistrationMessage struct {
 	Type              string `json:"type"`
 	OlmID             string `json:"olmId"`
 	NewtID            string `json:"newtId"`
@@ -23,13 +23,13 @@ type TCPRelayRegistrationMessage struct {
 	ExitNodePublicKey string `json:"exitNodePublicKey"`
 }
 
-func isTCPRelayRegistrationType(t string) bool {
-	return t == "relay-register" || t == "tcp-relay-register"
+func isWssRelayRegistrationType(t string) bool {
+	return t == "relay-register" || t == "tcp-relay-register" || t == "wss-relay-register"
 }
 
-// TCPProxyServer accepts framed packets over TCP and forwards them through the
-// same relay logic/path used by UDP.
-type TCPProxyServer struct {
+// WssRelayServer accepts framed packets from Pangolin's websocket bridge
+// over TCP and forwards them through the same relay logic/path used by UDP.
+type WssRelayServer struct {
 	addr     string
 	udpProxy *UDPProxyServer
 	listener net.Listener
@@ -39,9 +39,9 @@ type TCPProxyServer struct {
 	connections sync.Map // map[string]*DestinationConn where key is destination "ip:port-clientKey"
 }
 
-func NewTCPProxyServer(parentCtx context.Context, addr string, udpProxy *UDPProxyServer) *TCPProxyServer {
+func NewWssRelayServer(parentCtx context.Context, addr string, udpProxy *UDPProxyServer) *WssRelayServer {
 	ctx, cancel := context.WithCancel(parentCtx)
-	return &TCPProxyServer{
+	return &WssRelayServer{
 		addr:     addr,
 		udpProxy: udpProxy,
 		ctx:      ctx,
@@ -49,7 +49,7 @@ func NewTCPProxyServer(parentCtx context.Context, addr string, udpProxy *UDPProx
 	}
 }
 
-func (s *TCPProxyServer) Start() error {
+func (s *WssRelayServer) Start() error {
 	if s.udpProxy == nil {
 		return fmt.Errorf("udp proxy is required")
 	}
@@ -59,7 +59,7 @@ func (s *TCPProxyServer) Start() error {
 		return err
 	}
 	s.listener = listener
-	logger.Info("TCP relay listening on %s", s.addr)
+	logger.Info("WSS relay listening on %s", s.addr)
 
 	go s.acceptLoop()
 	go s.cleanupIdleConnections()
@@ -67,7 +67,7 @@ func (s *TCPProxyServer) Start() error {
 	return nil
 }
 
-func (s *TCPProxyServer) Stop() {
+func (s *WssRelayServer) Stop() {
 	if s.cancel != nil {
 		s.cancel()
 	}
@@ -82,7 +82,7 @@ func (s *TCPProxyServer) Stop() {
 	})
 }
 
-func (s *TCPProxyServer) acceptLoop() {
+func (s *WssRelayServer) acceptLoop() {
 	for {
 		conn, err := s.listener.Accept()
 		if err != nil {
@@ -90,7 +90,7 @@ func (s *TCPProxyServer) acceptLoop() {
 			case <-s.ctx.Done():
 				return
 			default:
-				logger.Error("TCP relay accept error: %v", err)
+				logger.Error("WSS relay accept error: %v", err)
 				continue
 			}
 		}
@@ -98,11 +98,11 @@ func (s *TCPProxyServer) acceptLoop() {
 	}
 }
 
-func (s *TCPProxyServer) handleConnection(conn net.Conn) {
+func (s *WssRelayServer) handleConnection(conn net.Conn) {
 	defer conn.Close()
 
 	remoteAddr := conn.RemoteAddr().String()
-	logger.Debug("TCP connection from %s", remoteAddr)
+	logger.Debug("WSS relay bridge connection from %s", remoteAddr)
 
 	for {
 		select {
@@ -111,44 +111,44 @@ func (s *TCPProxyServer) handleConnection(conn net.Conn) {
 		default:
 		}
 
-		packet, err := readTCPFramedPacket(conn)
+		packet, err := readFramedPacket(conn)
 		if err != nil {
-			logger.Debug("TCP relay connection closed: %s (%v)", remoteAddr, err)
+			logger.Debug("WSS relay connection closed: %s (%v)", remoteAddr, err)
 			return
 		}
 
-		logger.Debug("TCP connection from %s, processing packet (len=%d)", remoteAddr, len(packet))
+		logger.Debug("WSS relay bridge connection from %s, processing packet (len=%d)", remoteAddr, len(packet))
 		if err := s.processPacket(packet, remoteAddr, func(data []byte) error {
-			return writeTCPFramedPacket(conn, data)
+			return writeFramedPacket(conn, data)
 		}); err != nil {
-			logger.Debug("TCP relay packet processing failed for %s: %v", remoteAddr, err)
+			logger.Debug("WSS relay packet processing failed for %s: %v", remoteAddr, err)
 		}
 	}
 }
 
-func (s *TCPProxyServer) processPacket(packet []byte, clientKey string, writeResponse func([]byte) error) error {
+func (s *WssRelayServer) processPacket(packet []byte, clientKey string, writeResponse func([]byte) error) error {
 	if len(packet) == 0 {
 		return nil
 	}
 
 	if packet[0] >= 1 && packet[0] <= 4 {
-		s.handleWireGuardPacketTCP(packet, clientKey, writeResponse)
+		s.handleWireGuardPacketFramed(packet, clientKey, writeResponse)
 		return nil
 	}
 
 	// Relay tunnel registration packets are plain JSON and allow the server to
 	// create a proxy mapping for this TCP connection before WireGuard handshakes.
-	var registration TCPRelayRegistrationMessage
+	var registration WssRelayRegistrationMessage
 	if err := json.Unmarshal(packet, &registration); err == nil &&
-		isTCPRelayRegistrationType(registration.Type) &&
+		isWssRelayRegistrationType(registration.Type) &&
 		registration.Token != "" &&
 		(registration.OlmID != "" || registration.NewtID != "") {
 		return s.handleRegistration(registration, clientKey)
 	}
 	if err := json.Unmarshal(packet, &registration); err == nil &&
-		isTCPRelayRegistrationType(registration.Type) {
+		isWssRelayRegistrationType(registration.Type) {
 		logger.Warn(
-			"Rejected TCP relay registration from %s: missing required fields (token=%t olmId=%t newtId=%t)",
+			"Rejected WSS relay registration from %s: missing required fields (token=%t olmId=%t newtId=%t)",
 			clientKey,
 			registration.Token != "",
 			registration.OlmID != "",
@@ -195,13 +195,13 @@ func (s *TCPProxyServer) processPacket(packet []byte, clientKey string, writeRes
 		ClientPublicKey:   msg.PublicKey,
 	}
 
-	logger.Debug("Created endpoint from TCP client %s: IP=%s, Port=%d", clientKey, endpoint.IP, endpoint.Port)
+	logger.Debug("Created endpoint from WSS relay bridge client %s: IP=%s, Port=%d", clientKey, endpoint.IP, endpoint.Port)
 	s.udpProxy.notifyServer(endpoint)
 	s.udpProxy.clearSessionsForIP(endpoint.IP)
 	return nil
 }
 
-func (s *TCPProxyServer) handleRegistration(registration TCPRelayRegistrationMessage, clientKey string) error {
+func (s *WssRelayServer) handleRegistration(registration WssRelayRegistrationMessage, clientKey string) error {
 	host, port, err := net.SplitHostPort(clientKey)
 	if err != nil {
 		return fmt.Errorf("split client address: %w", err)
@@ -224,7 +224,7 @@ func (s *TCPProxyServer) handleRegistration(registration TCPRelayRegistrationMes
 	}
 
 	logger.Info(
-		"Registered TCP relay client %s for olmId=%s newtId=%s",
+		"Registered WSS relay client %s for olmId=%s newtId=%s",
 		clientKey,
 		registration.OlmID,
 		registration.NewtID,
@@ -235,28 +235,28 @@ func (s *TCPProxyServer) handleRegistration(registration TCPRelayRegistrationMes
 	return nil
 }
 
-func (s *TCPProxyServer) handleWireGuardPacketTCP(packet []byte, clientKey string, writeResponse func([]byte) error) {
+func (s *WssRelayServer) handleWireGuardPacketFramed(packet []byte, clientKey string, writeResponse func([]byte) error) {
 	if len(packet) == 0 {
-		logger.Error("Received empty TCP WireGuard packet")
+		logger.Error("Received empty framed WireGuard packet")
 		return
 	}
 
 	messageType := packet[0]
 	receiverIndex, senderIndex, ok := extractWireGuardIndices(packet)
 	if !ok {
-		logger.Error("Failed to extract WireGuard indices from TCP packet")
+		logger.Error("Failed to extract WireGuard indices from framed packet")
 		return
 	}
 
 	mappingObj, ok := s.udpProxy.proxyMappings.Load(clientKey)
 	if !ok {
-		logger.Debug("TCP relay: no proxy mapping for %s", clientKey)
+		logger.Debug("WSS relay: no proxy mapping for %s", clientKey)
 		return
 	}
 
 	proxyMapping := mappingObj.(ProxyMapping)
 	logger.Debug(
-		"TCP relay: found proxy mapping for %s with %d destinations",
+		"WSS relay: found proxy mapping for %s with %d destinations",
 		clientKey,
 		len(proxyMapping.Destinations),
 	)
@@ -268,18 +268,18 @@ func (s *TCPProxyServer) handleWireGuardPacketTCP(packet []byte, clientKey strin
 		for _, dest := range proxyMapping.Destinations {
 			destAddr, err := net.ResolveUDPAddr("udp", fmt.Sprintf("%s:%d", dest.DestinationIP, dest.DestinationPort))
 			if err != nil {
-				logger.Error("Failed to resolve TCP relay destination: %v", err)
+				logger.Error("Failed to resolve WSS relay destination: %v", err)
 				continue
 			}
 
 			conn, err := s.getOrCreateConnection(destAddr, clientKey, writeResponse)
 			if err != nil {
-				logger.Error("Failed to create TCP relay UDP connection: %v", err)
+				logger.Error("Failed to create WSS relay UDP connection: %v", err)
 				continue
 			}
 
 			if _, err = conn.Write(packet); err != nil {
-				logger.Debug("Failed to forward TCP relay handshake initiation: %v", err)
+				logger.Debug("Failed to forward WSS relay handshake initiation: %v", err)
 			}
 		}
 
@@ -296,18 +296,18 @@ func (s *TCPProxyServer) handleWireGuardPacketTCP(packet []byte, clientKey strin
 		for _, dest := range proxyMapping.Destinations {
 			destAddr, err := net.ResolveUDPAddr("udp", fmt.Sprintf("%s:%d", dest.DestinationIP, dest.DestinationPort))
 			if err != nil {
-				logger.Error("Failed to resolve TCP relay destination: %v", err)
+				logger.Error("Failed to resolve WSS relay destination: %v", err)
 				continue
 			}
 
 			conn, err := s.getOrCreateConnection(destAddr, clientKey, writeResponse)
 			if err != nil {
-				logger.Error("Failed to create TCP relay UDP connection: %v", err)
+				logger.Error("Failed to create WSS relay UDP connection: %v", err)
 				continue
 			}
 
 			if _, err = conn.Write(packet); err != nil {
-				logger.Error("Failed to forward TCP relay handshake response: %v", err)
+				logger.Error("Failed to forward WSS relay handshake response: %v", err)
 			}
 		}
 
@@ -315,24 +315,24 @@ func (s *TCPProxyServer) handleWireGuardPacketTCP(packet []byte, clientKey strin
 		for _, dest := range proxyMapping.Destinations {
 			destAddr, err := net.ResolveUDPAddr("udp", fmt.Sprintf("%s:%d", dest.DestinationIP, dest.DestinationPort))
 			if err != nil {
-				logger.Error("Failed to resolve TCP relay destination: %v", err)
+				logger.Error("Failed to resolve WSS relay destination: %v", err)
 				continue
 			}
 
 			conn, err := s.getOrCreateConnection(destAddr, clientKey, writeResponse)
 			if err != nil {
-				logger.Error("Failed to create TCP relay UDP connection: %v", err)
+				logger.Error("Failed to create WSS relay UDP connection: %v", err)
 				continue
 			}
 
 			if _, err = conn.Write(packet); err != nil {
-				logger.Debug("Failed to forward TCP relay packet: %v", err)
+				logger.Debug("Failed to forward WSS relay packet: %v", err)
 			}
 		}
 	}
 }
 
-func (s *TCPProxyServer) getOrCreateConnection(destAddr *net.UDPAddr, clientKey string, writeResponse func([]byte) error) (*net.UDPConn, error) {
+func (s *WssRelayServer) getOrCreateConnection(destAddr *net.UDPAddr, clientKey string, writeResponse func([]byte) error) (*net.UDPConn, error) {
 	key := destAddr.String() + "-" + clientKey
 	if conn, ok := s.connections.Load(key); ok {
 		destConn := conn.(*DestinationConn)
@@ -354,23 +354,23 @@ func (s *TCPProxyServer) getOrCreateConnection(destAddr *net.UDPAddr, clientKey 
 	return newConn, nil
 }
 
-func (s *TCPProxyServer) handleResponses(conn *net.UDPConn, connectionKey string, writeResponse func([]byte) error) {
+func (s *WssRelayServer) handleResponses(conn *net.UDPConn, connectionKey string, writeResponse func([]byte) error) {
 	buffer := make([]byte, 1500)
 	for {
 		n, err := conn.Read(buffer)
 		if err != nil {
-			logger.Debug("TCP relay downstream read error on %s: %v", connectionKey, err)
+			logger.Debug("WSS relay downstream read error on %s: %v", connectionKey, err)
 			return
 		}
 
 		if err := writeResponse(buffer[:n]); err != nil {
-			logger.Debug("TCP relay write response failed on %s: %v", connectionKey, err)
+			logger.Debug("WSS relay write response failed on %s: %v", connectionKey, err)
 			return
 		}
 	}
 }
 
-func (s *TCPProxyServer) cleanupIdleConnections() {
+func (s *WssRelayServer) cleanupIdleConnections() {
 	ticker := time.NewTicker(5 * time.Minute)
 	defer ticker.Stop()
 	for {
@@ -391,9 +391,9 @@ func (s *TCPProxyServer) cleanupIdleConnections() {
 	}
 }
 
-func readTCPFramedPacket(conn net.Conn) ([]byte, error) {
+func readFramedPacket(conn net.Conn) ([]byte, error) {
 	header := make([]byte, 4)
-	if _, err := ioReadFullTCP(conn, header); err != nil {
+	if _, err := ioReadFull(conn, header); err != nil {
 		return nil, err
 	}
 	length := binary.BigEndian.Uint32(header)
@@ -401,13 +401,13 @@ func readTCPFramedPacket(conn net.Conn) ([]byte, error) {
 		return nil, fmt.Errorf("invalid frame length %d", length)
 	}
 	packet := make([]byte, length)
-	if _, err := ioReadFullTCP(conn, packet); err != nil {
+	if _, err := ioReadFull(conn, packet); err != nil {
 		return nil, err
 	}
 	return packet, nil
 }
 
-func writeTCPFramedPacket(conn net.Conn, payload []byte) error {
+func writeFramedPacket(conn net.Conn, payload []byte) error {
 	if len(payload) == 0 {
 		return nil
 	}
@@ -420,7 +420,7 @@ func writeTCPFramedPacket(conn net.Conn, payload []byte) error {
 	return err
 }
 
-func ioReadFullTCP(conn net.Conn, buf []byte) (int, error) {
+func ioReadFull(conn net.Conn, buf []byte) (int, error) {
 	total := 0
 	for total < len(buf) {
 		n, err := conn.Read(buf[total:])

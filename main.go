@@ -34,16 +34,16 @@ import (
 )
 
 var (
-	interfaceName string
-	listenAddr    string
-	mtuInt        int
-	lastReadings  = make(map[string]PeerReading)
-	mu            sync.Mutex
-	wgMu          sync.Mutex // Protects WireGuard operations
-	notifyURL     string
-	proxyRelay    *relay.UDPProxyServer
-	proxyTCPRelay *relay.TCPProxyServer
-	proxySNI      *proxy.SNIProxy
+	interfaceName    string
+	listenAddr       string
+	mtuInt           int
+	lastReadings     = make(map[string]PeerReading)
+	mu               sync.Mutex
+	wgMu             sync.Mutex // Protects WireGuard operations
+	notifyURL        string
+	proxyRelay       *relay.UDPProxyServer
+	proxyWssRelay    *relay.WssRelayServer
+	proxySNI         *proxy.SNIProxy
 	doTrafficShaping bool
 	bandwidthLimit   string
 	ifbName          string // IFB device name for ingress traffic shaping
@@ -162,7 +162,7 @@ func main() {
 		logLevel             string
 		mtu                  string
 		sniProxyPort         int
-		tcpRelayPort         int
+		wssRelayPort         int
 		localProxyAddr       string
 		localProxyPort       int
 		localOverridesStr    string
@@ -275,7 +275,7 @@ func main() {
 	if sniProxyPortStr == "" {
 		flag.IntVar(&sniProxyPort, "sni-port", 8443, "Port to listen on")
 	}
-	flag.IntVar(&tcpRelayPort, "tcp-relay-port", 4430, "Port for internal TCP relay listener")
+	flag.IntVar(&wssRelayPort, "wss-relay-port", 4430, "Port for internal WSS relay bridge listener")
 
 	if localProxyAddr == "" {
 		flag.StringVar(&localProxyAddr, "local-proxy", "localhost", "Local proxy address")
@@ -507,12 +507,12 @@ func main() {
 	}
 	defer proxyRelay.Stop()
 
-	proxyTCPRelay = relay.NewTCPProxyServer(groupCtx, fmt.Sprintf(":%d", tcpRelayPort), proxyRelay)
-	err = proxyTCPRelay.Start()
+	proxyWssRelay = relay.NewWssRelayServer(groupCtx, fmt.Sprintf(":%d", wssRelayPort), proxyRelay)
+	err = proxyWssRelay.Start()
 	if err != nil {
-		logger.Fatal("Failed to start TCP relay server: %v", err)
+		logger.Fatal("Failed to start WSS relay server: %v", err)
 	}
-	defer proxyTCPRelay.Stop()
+	defer proxyWssRelay.Stop()
 
 	// TODO: WE SHOULD PULL THIS OUT OF THE CONFIG OR SOMETHING
 	// 		 SO YOU DON'T NEED TO SET THIS SEPARATELY
@@ -585,8 +585,8 @@ func main() {
 		if proxyRelay != nil {
 			proxyRelay.Stop()
 		}
-		if proxyTCPRelay != nil {
-			proxyTCPRelay.Stop()
+		if proxyWssRelay != nil {
+			proxyWssRelay.Stop()
 		}
 		return nil
 	})
