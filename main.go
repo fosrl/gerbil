@@ -355,21 +355,8 @@ func main() {
 		return periodicBandwidthCheck(groupCtx, remoteConfigURL+"/gerbil/receive-bandwidth")
 	})
 
-	// Start the UDP proxy server
-	relayPort := wgconfig.RelayPort
-	if relayPort == 0 {
-		relayPort = 21820 // in case there is no relay port set, use 21820
-	}
-	proxyRelay = relay.NewUDPProxyServer(groupCtx, fmt.Sprintf(":%d", relayPort), remoteConfigURL, key, reachableAt)
-	err = proxyRelay.Start()
-	if err != nil {
-		logger.Fatal("Failed to start UDP proxy server: %v", err)
-	}
-	defer proxyRelay.Stop()
-
-	// TODO: WE SHOULD PULL THIS OUT OF THE CONFIG OR SOMETHING
-	// 		 SO YOU DON'T NEED TO SET THIS SEPARATELY
-	// Parse local overrides
+	// Parse local overrides and trusted upstreams early so that both the relay
+	// and the SNI proxy share the same configuration values.
 	var localOverrides []string
 	if localOverridesStr != "" {
 		localOverrides = strings.Split(localOverridesStr, ",")
@@ -387,6 +374,21 @@ func main() {
 		}
 		logger.Info("Trusted upstreams configured: %v", trustedUpstreams)
 	}
+
+	// Start the UDP proxy server.
+	// proxyProtocol and trustedUpstreams are forwarded so the relay can strip
+	// PROXY protocol v2 headers from load-balancer traffic and recover the
+	// original client IP for hole-punch registration.
+	relayPort := wgconfig.RelayPort
+	if relayPort == 0 {
+		relayPort = 21820 // in case there is no relay port set, use 21820
+	}
+	proxyRelay = relay.NewUDPProxyServer(groupCtx, fmt.Sprintf(":%d", relayPort), remoteConfigURL, key, reachableAt, proxyProtocol, trustedUpstreams)
+	err = proxyRelay.Start()
+	if err != nil {
+		logger.Fatal("Failed to start UDP proxy server: %v", err)
+	}
+	defer proxyRelay.Stop()
 
 	proxySNI, err = proxy.NewSNIProxy(sniProxyPort, remoteConfigURL, key.PublicKey().String(), localProxyAddr, localProxyPort, localOverrides, proxyProtocol, trustedUpstreams)
 	if err != nil {
