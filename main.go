@@ -1665,6 +1665,10 @@ func ensureIFBDevice() error {
 // Bandwidth limit is configurable via the --bandwidth-limit flag or BANDWIDTH_LIMIT env var (default: 50mbit)
 func setupPeerBandwidthLimit(peerIP string) error {
 	logger.Debug("setupPeerBandwidthLimit called for peer IP: %s", peerIP)
+<<<<<<< HEAD
+=======
+
+>>>>>>> 06969a4 (Add var for b limit)
 
 	// Parse the IP to get just the IP address (strip any CIDR notation if present)
 	ip := peerIP
