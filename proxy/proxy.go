@@ -718,6 +718,7 @@ func (p *SNIProxy) getRoute(hostname, clientAddr string) (*RouteRecord, error) {
 	// Make HTTP request
 	apiStart := time.Now()
 	// Make HTTP request using reusable client
+	apiStart := time.Now()
 	resp, err := p.httpClient.Do(req)
 	if err != nil {
 		metrics.RecordSNIRouteAPIRequest("error")
