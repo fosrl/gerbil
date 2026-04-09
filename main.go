@@ -23,6 +23,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/fosrl/gerbil/internal/metrics"
 	"github.com/fosrl/gerbil/logger"
 	"github.com/fosrl/gerbil/proxy"
 	"github.com/fosrl/gerbil/relay"
@@ -43,6 +44,8 @@ var (
 	proxyRelay       *relay.UDPProxyServer
 	proxySNI         *proxy.SNIProxy
 	doTrafficShaping bool
+	bandwidthLimit   string
+	ifbName          string // IFB device name for ingress traffic shaping
 )
 
 type WgConfig struct {
@@ -99,6 +102,35 @@ type UpdateDestinationsRequest struct {
 	Destinations []relay.PeerDestination `json:"destinations"`
 }
 
+// httpMetricsMiddleware wraps HTTP handlers with metrics tracking
+func httpMetricsMiddleware(endpoint string, handler http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		startTime := time.Now()
+
+		// Create a response writer wrapper to capture status code
+		ww := &responseWriterWrapper{ResponseWriter: w, statusCode: http.StatusOK}
+
+		// Call the actual handler
+		handler(ww, r)
+
+		// Record metrics
+		duration := time.Since(startTime).Seconds()
+		metrics.RecordHTTPRequest(endpoint, r.Method, fmt.Sprintf("%d", ww.statusCode))
+		metrics.RecordHTTPRequestDuration(endpoint, r.Method, duration)
+	}
+}
+
+// responseWriterWrapper wraps http.ResponseWriter to capture status code
+type responseWriterWrapper struct {
+	http.ResponseWriter
+	statusCode int
+}
+
+func (w *responseWriterWrapper) WriteHeader(statusCode int) {
+	w.statusCode = statusCode
+	w.ResponseWriter.WriteHeader(statusCode)
+}
+
 func parseLogLevel(level string) logger.LogLevel {
 	switch strings.ToUpper(level) {
 	case "DEBUG":
@@ -134,6 +166,15 @@ func main() {
 		localOverridesStr    string
 		trustedUpstreamsStr  string
 		proxyProtocol        bool
+
+		// Metrics configuration variables (set from env, then overridden by CLI flags)
+		metricsEnabled            bool
+		metricsBackend            string
+		metricsPath               string
+		otelMetricsProtocol       string
+		otelMetricsEndpoint       string
+		otelMetricsInsecure       bool
+		otelMetricsExportInterval time.Duration
 	)
 
 	interfaceName = os.Getenv("INTERFACE")
@@ -153,6 +194,41 @@ func main() {
 	trustedUpstreamsStr = os.Getenv("TRUSTED_UPSTREAMS")
 	proxyProtocolStr := os.Getenv("PROXY_PROTOCOL")
 	doTrafficShapingStr := os.Getenv("DO_TRAFFIC_SHAPING")
+	bandwidthLimitStr := os.Getenv("BANDWIDTH_LIMIT")
+
+	// Read metrics env vars (defaults applied by DefaultMetricsConfig; these override defaults).
+	metricsEnabled = true // default
+	if v := os.Getenv("METRICS_ENABLED"); v != "" {
+		metricsEnabled = strings.ToLower(v) == "true"
+	}
+	metricsBackend = "prometheus" // default
+	if v := os.Getenv("METRICS_BACKEND"); v != "" {
+		metricsBackend = v
+	}
+	metricsPath = "/metrics" // default
+	if v := os.Getenv("METRICS_PATH"); v != "" {
+		metricsPath = v
+	}
+	otelMetricsProtocol = "grpc" // default
+	if v := os.Getenv("OTEL_METRICS_PROTOCOL"); v != "" {
+		otelMetricsProtocol = v
+	}
+	otelMetricsEndpoint = "localhost:4317" // default
+	if v := os.Getenv("OTEL_METRICS_ENDPOINT"); v != "" {
+		otelMetricsEndpoint = v
+	}
+	otelMetricsInsecure = true // default
+	if v := os.Getenv("OTEL_METRICS_INSECURE"); v != "" {
+		otelMetricsInsecure = strings.ToLower(v) == "true"
+	}
+	otelMetricsExportInterval = 60 * time.Second // default
+	if v := os.Getenv("OTEL_METRICS_EXPORT_INTERVAL"); v != "" {
+		if d, err2 := time.ParseDuration(v); err2 == nil {
+			otelMetricsExportInterval = d
+		} else {
+			log.Printf("WARN: invalid OTEL_METRICS_EXPORT_INTERVAL=%q: %v", v, err2)
+		}
+	}
 
 	if interfaceName == "" {
 		flag.StringVar(&interfaceName, "interface", "wg0", "Name of the WireGuard interface")
@@ -231,10 +307,64 @@ func main() {
 		flag.BoolVar(&doTrafficShaping, "do-traffic-shaping", false, "Whether to set up traffic shaping rules for peers (requires tc command and root privileges)")
 	}
 
+	if bandwidthLimitStr != "" {
+		bandwidthLimit = bandwidthLimitStr
+	}
+	if bandwidthLimitStr == "" {
+		flag.StringVar(&bandwidthLimit, "bandwidth-limit", "50mbit", "Bandwidth limit per peer for traffic shaping (e.g. 50mbit, 1gbit)")
+	}
+
+	// Metrics CLI flags – always registered so that CLI overrides env/defaults.
+	flag.BoolVar(&metricsEnabled, "metrics-enabled", metricsEnabled, "Enable metrics collection (default: true)")
+	flag.StringVar(&metricsBackend, "metrics-backend", metricsBackend, "Metrics backend: prometheus, otel, or none")
+	flag.StringVar(&metricsPath, "metrics-path", metricsPath, "HTTP path for Prometheus /metrics endpoint")
+	flag.StringVar(&otelMetricsProtocol, "otel-metrics-protocol", otelMetricsProtocol, "OTLP transport protocol: grpc or http")
+	flag.StringVar(&otelMetricsEndpoint, "otel-metrics-endpoint", otelMetricsEndpoint, "OTLP collector endpoint (e.g. localhost:4317)")
+	flag.BoolVar(&otelMetricsInsecure, "otel-metrics-insecure", otelMetricsInsecure, "Disable TLS for OTLP connection")
+	flag.DurationVar(&otelMetricsExportInterval, "otel-metrics-export-interval", otelMetricsExportInterval, "Interval between OTLP metric pushes")
+
 	flag.Parse()
+
+	// Derive IFB device name from the WireGuard interface name (Linux limit: 15 chars)
+	ifbName = "ifb_" + interfaceName
+	if len(ifbName) > 15 {
+		ifbName = ifbName[:15]
+	}
 
 	logger.Init()
 	logger.GetLogger().SetLevel(parseLogLevel(logLevel))
+
+	// Initialize metrics with the selected backend.
+	// Config precedence: CLI flags > env vars > defaults (already applied above).
+	metricsHandler, err := metrics.Initialize(metrics.Config{
+		Enabled: metricsEnabled,
+		Backend: metricsBackend,
+		Prometheus: metrics.PrometheusConfig{
+			Path: metricsPath,
+		},
+		OTel: metrics.OTelConfig{
+			Protocol:       otelMetricsProtocol,
+			Endpoint:       otelMetricsEndpoint,
+			Insecure:       otelMetricsInsecure,
+			ExportInterval: otelMetricsExportInterval,
+		},
+		ServiceName:           "gerbil",
+		ServiceVersion:        "1.0.0",
+		DeploymentEnvironment: os.Getenv("DEPLOYMENT_ENVIRONMENT"),
+	})
+	if err != nil {
+		logger.Fatal("Failed to initialize metrics: %v", err)
+	}
+	defer func() {
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if err := metrics.Shutdown(shutdownCtx); err != nil {
+			logger.Error("Failed to shutdown metrics: %v", err)
+		}
+	}()
+
+	// Record restart metric
+	metrics.RecordRestart()
 
 	// Base context for the application; cancel on SIGINT/SIGTERM
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
@@ -344,6 +474,13 @@ func main() {
 		logger.Fatal("Failed to ensure WireGuard interface: %v", err)
 	}
 
+	// Set up IFB device for bidirectional ingress/egress traffic shaping if enabled
+	if doTrafficShaping {
+		if err := ensureIFBDevice(); err != nil {
+			logger.Fatal("Failed to ensure IFB device for traffic shaping: %v", err)
+		}
+	}
+
 	// Ensure the WireGuard peers exist
 	ensureWireguardPeers(wgconfig.Peers)
 
@@ -397,18 +534,27 @@ func main() {
 		logger.Fatal("Failed to start proxy: %v", err)
 	}
 
-	// Set up HTTP server
-	http.HandleFunc("/peer", handlePeer)
-	http.HandleFunc("/update-proxy-mapping", handleUpdateProxyMapping)
-	http.HandleFunc("/update-destinations", handleUpdateDestinations)
-	http.HandleFunc("/update-local-snis", handleUpdateLocalSNIs)
-	http.HandleFunc("/healthz", handleHealthz)
+	// Set up HTTP server with metrics middleware
+	http.HandleFunc("/peer", httpMetricsMiddleware("peer", handlePeer))
+	http.HandleFunc("/update-proxy-mapping", httpMetricsMiddleware("update_proxy_mapping", handleUpdateProxyMapping))
+	http.HandleFunc("/update-destinations", httpMetricsMiddleware("update_destinations", handleUpdateDestinations))
+	http.HandleFunc("/update-local-snis", httpMetricsMiddleware("update_local_snis", handleUpdateLocalSNIs))
+	http.HandleFunc("/healthz", httpMetricsMiddleware("healthz", handleHealthz))
+
+	// Register metrics endpoint only for Prometheus backend.
+	// OTel backend pushes to a collector; no /metrics endpoint needed.
+	if metricsHandler != nil {
+		http.Handle(metricsPath, metricsHandler)
+		logger.Info("Metrics endpoint enabled at %s", metricsPath)
+	}
+
 	logger.Info("Starting HTTP server on %s", listenAddr)
 
 	// HTTP server with graceful shutdown on context cancel
 	server := &http.Server{
-		Addr:    listenAddr,
-		Handler: nil,
+		Addr:              listenAddr,
+		Handler:           nil,
+		ReadHeaderTimeout: 3 * time.Second,
 	}
 	group.Go(func() error {
 		// http.ErrServerClosed is returned on graceful shutdown; not an error for us
@@ -443,26 +589,35 @@ func main() {
 func loadRemoteConfig(url string, key wgtypes.Key, reachableAt string) (WgConfig, error) {
 	var body *bytes.Buffer
 	if reachableAt == "" {
-		body = bytes.NewBuffer([]byte(fmt.Sprintf(`{"publicKey": "%s"}`, key.PublicKey().String())))
+		body = bytes.NewBuffer([]byte(fmt.Sprintf(`{"publicKey": %q}`, key.PublicKey().String())))
 	} else {
-		body = bytes.NewBuffer([]byte(fmt.Sprintf(`{"publicKey": "%s", "reachableAt": "%s"}`, key.PublicKey().String(), reachableAt)))
+		body = bytes.NewBuffer([]byte(fmt.Sprintf(`{"publicKey": %q, "reachableAt": %q}`, key.PublicKey().String(), reachableAt)))
 	}
 	resp, err := http.Post(url, "application/json", body)
 	if err != nil {
 		// print the error
 		logger.Error("Error fetching remote config %s: %v", url, err)
+		// Record remote config fetch error
+		metrics.RecordRemoteConfigFetch("error")
 		return WgConfig{}, err
 	}
 	defer resp.Body.Close()
 
 	data, err := io.ReadAll(resp.Body)
 	if err != nil {
+		metrics.RecordRemoteConfigFetch("error")
 		return WgConfig{}, err
 	}
 
 	var config WgConfig
 	err = json.Unmarshal(data, &config)
+	if err != nil {
+		metrics.RecordRemoteConfigFetch("error")
+		return config, err
+	}
 
+	// Record successful remote config fetch
+	metrics.RecordRemoteConfigFetch("success")
 	return config, err
 }
 
@@ -569,6 +724,10 @@ func ensureWireguardInterface(wgconfig WgConfig) error {
 	}
 
 	logger.Info("WireGuard interface %s created and configured", interfaceName)
+
+	// Record interface state metric
+	hostname, _ := os.Hostname()
+	metrics.RecordInterfaceUp(interfaceName, hostname, true)
 
 	return nil
 }
@@ -867,14 +1026,21 @@ func handleAddPeer(w http.ResponseWriter, r *http.Request) {
 	var peer Peer
 	if err := json.NewDecoder(r.Body).Decode(&peer); err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
+		// Record peer add error
+		metrics.RecordPeerOperation("add", "error")
 		return
 	}
 
 	err := addPeer(peer)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
+		// Record peer add error
+		metrics.RecordPeerOperation("add", "error")
 		return
 	}
+
+	// Record peer add success
+	metrics.RecordPeerOperation("add", "success")
 
 	// Notify if notifyURL is set
 	go notifyPeerChange("add", peer.PublicKey)
@@ -948,6 +1114,10 @@ func addPeerInternal(peer Peer) error {
 
 	logger.Info("Peer %s added successfully", peer.PublicKey)
 
+	// Record metrics
+	metrics.RecordPeersTotal(interfaceName, 1)
+	metrics.RecordAllowedIPsCount(interfaceName, peer.PublicKey, int64(len(peer.AllowedIPs)))
+
 	return nil
 }
 
@@ -955,14 +1125,21 @@ func handleRemovePeer(w http.ResponseWriter, r *http.Request) {
 	publicKey := r.URL.Query().Get("public_key")
 	if publicKey == "" {
 		http.Error(w, "Missing public_key query parameter", http.StatusBadRequest)
+		// Record peer remove error
+		metrics.RecordPeerOperation("remove", "error")
 		return
 	}
 
 	err := removePeer(publicKey)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
+		// Record peer remove error
+		metrics.RecordPeerOperation("remove", "error")
 		return
 	}
+
+	// Record peer remove success
+	metrics.RecordPeerOperation("remove", "success")
 
 	// Notify if notifyURL is set
 	go notifyPeerChange("remove", publicKey)
@@ -1029,6 +1206,10 @@ func removePeerInternal(publicKey string) error {
 
 	logger.Info("Peer %s removed successfully", publicKey)
 
+	// Record metrics
+	metrics.RecordPeersTotal(interfaceName, -1)
+	metrics.RecordAllowedIPsCount(interfaceName, publicKey, -int64(len(wgIPs)))
+
 	return nil
 }
 
@@ -1063,6 +1244,8 @@ func handleUpdateProxyMapping(w http.ResponseWriter, r *http.Request) {
 	if proxyRelay == nil {
 		logger.Error("Proxy server is not available")
 		http.Error(w, "Proxy server is not available", http.StatusInternalServerError)
+		// Record error
+		metrics.RecordProxyMappingUpdateRequest("error")
 		return
 	}
 
@@ -1072,6 +1255,9 @@ func handleUpdateProxyMapping(w http.ResponseWriter, r *http.Request) {
 		updatedCount,
 		update.OldDestination.DestinationIP, update.OldDestination.DestinationPort,
 		update.NewDestination.DestinationIP, update.NewDestination.DestinationPort)
+
+	// Record success
+	metrics.RecordProxyMappingUpdateRequest("success")
 
 	w.WriteHeader(http.StatusOK)
 	json.NewEncoder(w).Encode(map[string]interface{}{
@@ -1133,6 +1319,8 @@ func handleUpdateDestinations(w http.ResponseWriter, r *http.Request) {
 	if proxyRelay == nil {
 		logger.Error("Proxy server is not available")
 		http.Error(w, "Proxy server is not available", http.StatusInternalServerError)
+		// Record error
+		metrics.RecordDestinationsUpdateRequest("error")
 		return
 	}
 
@@ -1140,6 +1328,9 @@ func handleUpdateDestinations(w http.ResponseWriter, r *http.Request) {
 
 	logger.Info("Updated proxy mapping for %s:%d with %d destinations",
 		request.SourceIP, request.SourcePort, len(request.Destinations))
+
+	// Record success
+	metrics.RecordDestinationsUpdateRequest("success")
 
 	w.WriteHeader(http.StatusOK)
 	json.NewEncoder(w).Encode(map[string]interface{}{
@@ -1202,7 +1393,7 @@ func calculatePeerBandwidth() ([]PeerBandwidth, error) {
 		return nil, fmt.Errorf("failed to get device: %v", err)
 	}
 
-	peerBandwidths := []PeerBandwidth{}
+	var peerBandwidths []PeerBandwidth
 	now := time.Now()
 
 	mu.Lock()
@@ -1243,6 +1434,14 @@ func calculatePeerBandwidth() ([]PeerBandwidth, error) {
 				bytesInMB := bytesInDiff / (1024 * 1024)
 				bytesOutMB := bytesOutDiff / (1024 * 1024)
 
+				// Record metrics (in bytes)
+				if bytesInDiff > 0 {
+					metrics.RecordBytesReceived(interfaceName, publicKey, int64(bytesInDiff))
+				}
+				if bytesOutDiff > 0 {
+					metrics.RecordBytesTransmitted(interfaceName, publicKey, int64(bytesOutDiff))
+				}
+
 				peerBandwidths = append(peerBandwidths, PeerBandwidth{
 					PublicKey: publicKey,
 					BytesIn:   bytesInMB,
@@ -1282,24 +1481,31 @@ func calculatePeerBandwidth() ([]PeerBandwidth, error) {
 func reportPeerBandwidth(apiURL string) error {
 	bandwidths, err := calculatePeerBandwidth()
 	if err != nil {
+		// Record bandwidth report error
+		metrics.RecordBandwidthReport("error")
 		return fmt.Errorf("failed to calculate peer bandwidth: %v", err)
 	}
 
 	jsonData, err := json.Marshal(bandwidths)
 	if err != nil {
+		metrics.RecordBandwidthReport("error")
 		return fmt.Errorf("failed to marshal bandwidth data: %v", err)
 	}
 
 	resp, err := http.Post(apiURL, "application/json", bytes.NewBuffer(jsonData))
 	if err != nil {
+		metrics.RecordBandwidthReport("error")
 		return fmt.Errorf("failed to send bandwidth data: %v", err)
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
+		metrics.RecordBandwidthReport("error")
 		return fmt.Errorf("API returned non-OK status: %s", resp.Status)
 	}
 
+	// Record successful bandwidth report
+	metrics.RecordBandwidthReport("success")
 	return nil
 }
 
@@ -1333,7 +1539,16 @@ func monitorMemory(limit uint64) {
 	for {
 		runtime.ReadMemStats(&m)
 		if m.Alloc > limit {
+			// Determine severity based on how much over the limit
+			severity := "warning"
+			if m.Alloc > limit*2 {
+				severity = "critical"
+			}
+
 			fmt.Printf("Memory spike detected (%d bytes). Dumping profile...\n", m.Alloc)
+
+			// Record memory spike metric
+			metrics.RecordMemorySpike(severity)
 
 			f, err := os.Create(fmt.Sprintf("/var/config/heap/heap-spike-%d.pprof", time.Now().Unix()))
 			if err != nil {
@@ -1341,6 +1556,8 @@ func monitorMemory(limit uint64) {
 			} else {
 				pprof.WriteHeapProfile(f)
 				f.Close()
+				// Record heap profile written metric
+				metrics.RecordHeapProfileWritten()
 			}
 
 			// Wait a while before checking again to avoid spamming profiles
@@ -1350,11 +1567,91 @@ func monitorMemory(limit uint64) {
 	}
 }
 
+// ensureIFBDevice creates and configures the IFB (Intermediate Functional Block) device used to
+// shape ingress traffic on the WireGuard interface. Linux TC qdiscs only control egress by default;
+// the IFB trick redirects all ingress packets to a virtual device so HTB shaping can be applied
+// there, and the packets are transparently re-injected into the kernel network stack afterwards.
+// This is completely invisible to sockets/applications (including a reverse proxy on the host).
+func ensureIFBDevice() error {
+	// Check if the ifb kernel module is loaded (works inside containers too)
+	if _, err := os.Stat("/sys/module/ifb"); os.IsNotExist(err) {
+		logger.Warn("IFB module not loaded, skipping IFB setup and ingress traffic shaping")
+		return nil
+	}
+
+	// Create the IFB device if it does not already exist
+	_, err := netlink.LinkByName(ifbName)
+	if err != nil {
+		if _, ok := err.(netlink.LinkNotFoundError); ok {
+			cmd := exec.Command("ip", "link", "add", ifbName, "type", "ifb")
+			if out, err := cmd.CombinedOutput(); err != nil {
+				return fmt.Errorf("failed to create IFB device %s: %v, output: %s", ifbName, err, string(out))
+			}
+			logger.Info("Created IFB device %s", ifbName)
+		} else {
+			return fmt.Errorf("failed to look up IFB device %s: %v", ifbName, err)
+		}
+	} else {
+		logger.Info("IFB device %s already exists", ifbName)
+	}
+
+	// Bring the IFB device up
+	cmd := exec.Command("ip", "link", "set", "dev", ifbName, "up")
+	if out, err := cmd.CombinedOutput(); err != nil {
+		return fmt.Errorf("failed to bring up IFB device %s: %v, output: %s", ifbName, err, string(out))
+	}
+
+	// Attach an ingress qdisc to the WireGuard interface if one is not already present
+	cmd = exec.Command("tc", "qdisc", "show", "dev", interfaceName)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("failed to query qdiscs on %s: %v", interfaceName, err)
+	}
+	if !strings.Contains(string(out), "ingress") {
+		cmd = exec.Command("tc", "qdisc", "add", "dev", interfaceName, "handle", "ffff:", "ingress")
+		if out, err := cmd.CombinedOutput(); err != nil {
+			return fmt.Errorf("failed to add ingress qdisc to %s: %v, output: %s", interfaceName, err, string(out))
+		}
+		logger.Info("Added ingress qdisc to %s", interfaceName)
+	}
+
+	// Add a catch-all filter that redirects every ingress packet from wg0 to the IFB device.
+	// Per-peer rate limiting then happens on ifb0's egress HTB qdisc (handle 2:).
+	cmd = exec.Command("tc", "filter", "show", "dev", interfaceName, "parent", "ffff:")
+	out, err = cmd.CombinedOutput()
+	if err != nil || !strings.Contains(string(out), ifbName) {
+		cmd = exec.Command("tc", "filter", "add", "dev", interfaceName,
+			"parent", "ffff:", "protocol", "ip",
+			"u32", "match", "u32", "0", "0",
+			"action", "mirred", "egress", "redirect", "dev", ifbName)
+		if out, err := cmd.CombinedOutput(); err != nil {
+			return fmt.Errorf("failed to add ingress redirect filter on %s: %v, output: %s", interfaceName, err, string(out))
+		}
+		logger.Info("Added ingress redirect filter: %s -> %s", interfaceName, ifbName)
+	}
+
+	// Ensure an HTB root qdisc exists on the IFB device (handle 2:) for per-peer shaping
+	cmd = exec.Command("tc", "qdisc", "show", "dev", ifbName)
+	out, err = cmd.CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("failed to query qdiscs on %s: %v", ifbName, err)
+	}
+	if !strings.Contains(string(out), "htb") {
+		cmd = exec.Command("tc", "qdisc", "add", "dev", ifbName, "root", "handle", "2:", "htb", "default", "9999")
+		if out, err := cmd.CombinedOutput(); err != nil {
+			return fmt.Errorf("failed to add HTB qdisc to %s: %v, output: %s", ifbName, err, string(out))
+		}
+		logger.Info("Added HTB root qdisc (handle 2:) to IFB device %s", ifbName)
+	}
+
+	logger.Info("IFB device %s ready for ingress traffic shaping", ifbName)
+	return nil
+}
+
 // setupPeerBandwidthLimit sets up TC (Traffic Control) to limit bandwidth for a specific peer IP
-// Currently hardcoded to 20 Mbps per peer
+// Bandwidth limit is configurable via the --bandwidth-limit flag or BANDWIDTH_LIMIT env var (default: 50mbit)
 func setupPeerBandwidthLimit(peerIP string) error {
 	logger.Debug("setupPeerBandwidthLimit called for peer IP: %s", peerIP)
-	const bandwidthLimit = "50mbit" // 50 Mbps limit per peer
 
 	// Parse the IP to get just the IP address (strip any CIDR notation if present)
 	ip := peerIP
@@ -1413,23 +1710,50 @@ func setupPeerBandwidthLimit(peerIP string) error {
 		logger.Debug("Successfully added new class %s for peer IP %s", classID, ip)
 	}
 
-	// Add a filter to match traffic from this peer IP (ingress)
-	cmd = exec.Command("tc", "filter", "add", "dev", interfaceName, "protocol", "ip", "parent", "1:",
-		"prio", "1", "u32", "match", "ip", "src", ip, "flowid", classID)
-	if output, err := cmd.CombinedOutput(); err != nil {
-		// If filter fails, log but don't fail the peer addition
-		logger.Warn("Failed to add ingress filter for peer IP %s: %v, output: %s", ip, err, string(output))
-	}
-
-	// Add a filter to match traffic to this peer IP (egress)
+	// Add a filter to match traffic to this peer IP on wg0 egress (peer's download)
 	cmd = exec.Command("tc", "filter", "add", "dev", interfaceName, "protocol", "ip", "parent", "1:",
 		"prio", "1", "u32", "match", "ip", "dst", ip, "flowid", classID)
 	if output, err := cmd.CombinedOutput(); err != nil {
-		// If filter fails, log but don't fail the peer addition
 		logger.Warn("Failed to add egress filter for peer IP %s: %v, output: %s", ip, err, string(output))
 	}
 
-	logger.Info("Setup bandwidth limit of %s for peer IP %s (class %s)", bandwidthLimit, ip, classID)
+	// Set up ingress shaping on the IFB device (peer's upload / ingress on wg0).
+	// All wg0 ingress is redirected to ifb0 by ensureIFBDevice; we add a per-peer
+	// class + src filter here so each peer gets its own independent rate limit.
+	ifbClassID := fmt.Sprintf("2:%s", lastOctet)
+
+	// Check if the ifb kernel module is loaded (works inside containers too)
+	if _, err := os.Stat("/sys/module/ifb"); os.IsNotExist(err) {
+		logger.Warn("IFB module not loaded, skipping IFB setup and ingress traffic shaping.")
+		logger.Info("Setup bandwidth limit of %s for peer IP %s (egress class %s, ingress class %s)", bandwidthLimit, ip, classID, ifbClassID)
+		return nil
+	}
+
+	cmd = exec.Command("tc", "class", "add", "dev", ifbName, "parent", "2:", "classid", ifbClassID,
+		"htb", "rate", bandwidthLimit, "ceil", bandwidthLimit)
+	if output, err := cmd.CombinedOutput(); err != nil {
+		if strings.Contains(string(output), "File exists") {
+			cmd = exec.Command("tc", "class", "replace", "dev", ifbName, "parent", "2:", "classid", ifbClassID,
+				"htb", "rate", bandwidthLimit, "ceil", bandwidthLimit)
+			if output, err := cmd.CombinedOutput(); err != nil {
+				logger.Warn("Failed to replace IFB class for peer IP %s: %v, output: %s", ip, err, string(output))
+			} else {
+				logger.Debug("Replaced existing IFB class %s for peer IP %s", ifbClassID, ip)
+			}
+		} else {
+			logger.Warn("Failed to add IFB class for peer IP %s: %v, output: %s", ip, err, string(output))
+		}
+	} else {
+		logger.Debug("Added IFB class %s for peer IP %s", ifbClassID, ip)
+	}
+
+	cmd = exec.Command("tc", "filter", "add", "dev", ifbName, "protocol", "ip", "parent", "2:",
+		"prio", "1", "u32", "match", "ip", "src", ip, "flowid", ifbClassID)
+	if output, err := cmd.CombinedOutput(); err != nil {
+		logger.Warn("Failed to add IFB ingress filter for peer IP %s: %v, output: %s", ip, err, string(output))
+	}
+
+	logger.Info("Setup bandwidth limit of %s for peer IP %s (egress class %s, ingress class %s)", bandwidthLimit, ip, classID, ifbClassID)
 	return nil
 }
 
@@ -1489,15 +1813,59 @@ func removePeerBandwidthLimit(peerIP string) error {
 		}
 	}
 
-	// Remove the class
+	// Remove the egress class on wg0
 	cmd = exec.Command("tc", "class", "del", "dev", interfaceName, "classid", classID)
 	if output, err := cmd.CombinedOutput(); err != nil {
-		// It's okay if the class doesn't exist
 		if !strings.Contains(string(output), "No such file or directory") && !strings.Contains(string(output), "Cannot find") {
-			logger.Warn("Failed to remove class for peer IP %s: %v, output: %s", ip, err, string(output))
+			logger.Warn("Failed to remove egress class for peer IP %s: %v, output: %s", ip, err, string(output))
 		}
 	}
 
-	logger.Info("Removed bandwidth limit for peer IP %s (class %s)", ip, classID)
+	// Remove the ingress class and filters on the IFB device
+	ifbClassID := fmt.Sprintf("2:%s", lastOctet)
+
+	// Check if the ifb kernel module is loaded (works inside containers too)
+	if _, err := os.Stat("/sys/module/ifb"); os.IsNotExist(err) {
+		logger.Warn("IFB module not loaded, skipping IFB setup and ingress traffic shaping")
+		logger.Info("Removed bandwidth limit for peer IP %s (egress class %s, ingress class %s)", ip, classID, ifbClassID)
+		return nil
+	}
+
+	cmd = exec.Command("tc", "filter", "show", "dev", ifbName, "parent", "2:")
+	output, err = cmd.CombinedOutput()
+	if err != nil {
+		logger.Warn("Failed to list IFB filters for peer IP %s: %v, output: %s", ip, err, string(output))
+	} else {
+		lines := strings.Split(string(output), "\n")
+		for _, line := range lines {
+			if strings.Contains(line, "flowid "+ifbClassID) && strings.Contains(line, "fh ") {
+				parts := strings.Fields(line)
+				var handle string
+				for j, part := range parts {
+					if part == "fh" && j+1 < len(parts) {
+						handle = parts[j+1]
+						break
+					}
+				}
+				if handle != "" {
+					delCmd := exec.Command("tc", "filter", "del", "dev", ifbName, "parent", "2:", "handle", handle, "prio", "1", "u32")
+					if delOutput, delErr := delCmd.CombinedOutput(); delErr != nil {
+						logger.Debug("Failed to delete IFB filter handle %s for peer IP %s: %v, output: %s", handle, ip, delErr, string(delOutput))
+					} else {
+						logger.Debug("Deleted IFB filter handle %s for peer IP %s", handle, ip)
+					}
+				}
+			}
+		}
+	}
+
+	cmd = exec.Command("tc", "class", "del", "dev", ifbName, "classid", ifbClassID)
+	if output, err := cmd.CombinedOutput(); err != nil {
+		if !strings.Contains(string(output), "No such file or directory") && !strings.Contains(string(output), "Cannot find") {
+			logger.Warn("Failed to remove IFB class for peer IP %s: %v, output: %s", ip, err, string(output))
+		}
+	}
+
+	logger.Info("Removed bandwidth limit for peer IP %s (egress class %s, ingress class %s)", ip, classID, ifbClassID)
 	return nil
 }

@@ -40,6 +40,24 @@ The PROXY protocol allows downstream proxies to know the real client IP address 
 
 In single node (self hosted) Pangolin deployments this can be bypassed by using port 443:443 to route to Traefik instead of the SNI proxy at 8443.
 
+### Observability with OpenTelemetry
+
+Gerbil includes comprehensive OpenTelemetry metrics instrumentation for monitoring and observability. Metrics can be exported via:
+
+- **Prometheus**: Pull-based metrics at the `/metrics` endpoint (enabled by default)
+- **OTLP**: Push-based metrics to any OpenTelemetry-compatible collector
+
+Key metrics include:
+
+- WireGuard interface and peer status
+- Bandwidth usage per peer
+- Active relay sessions and proxy connections
+- Handshake success/failure rates
+- Route lookup cache hit/miss ratios
+- Go runtime metrics (GC, goroutines, memory)
+
+See [docs/observability.md](docs/observability.md) for complete documentation, metrics reference, and examples.
+
 ## CLI Args
 
 Important:

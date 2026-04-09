@@ -9,14 +9,18 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"runtime"
 	"sync"
 	"time"
 
+	"github.com/fosrl/gerbil/internal/metrics"
 	"github.com/fosrl/gerbil/logger"
 	"golang.org/x/crypto/chacha20poly1305"
 	"golang.org/x/crypto/curve25519"
 	"golang.zx2c4.com/wireguard/wgctrl/wgtypes"
 )
+
+const relayIfname = "relay"
 
 type EncryptedHolePunchMessage struct {
 	EphemeralPublicKey string `json:"ephemeralPublicKey"`
@@ -118,6 +122,13 @@ type Packet struct {
 	n          int
 }
 
+// holePunchRateLimitEntry tracks hole punch message counts within a sliding 1-second window.
+type holePunchRateLimitEntry struct {
+	mu          sync.Mutex
+	count       int
+	windowStart time.Time
+}
+
 // WireGuard message types
 const (
 	WireGuardMessageTypeHandshakeInitiation = 1
@@ -150,9 +161,17 @@ type UDPProxyServer struct {
 	// Session tracking for WireGuard peers
 	// Key format: "senderIndex:receiverIndex"
 	wgSessions sync.Map
+	// Session index for O(1) lookup by receiver index
+	// Key: receiverIndex (uint32), Value: *WireGuardSession
+	sessionsByReceiverIndex sync.Map
 	// Communication pattern tracking for rebuilding sessions
 	// Key format: "clientIP:clientPort-destIP:destPort"
 	commPatterns sync.Map
+	// Rate limiter for encrypted hole punch messages, keyed by "ip:port"
+	holePunchRateLimiter sync.Map
+	// Cache for resolved UDP addresses to avoid per-packet DNS lookups
+	// Key: "ip:port" string, Value: *net.UDPAddr
+	addrCache sync.Map
 	// ReachableAt is the URL where this server can be reached
 	ReachableAt string
 }
@@ -164,7 +183,7 @@ func NewUDPProxyServer(parentCtx context.Context, addr, serverURL string, privat
 		addr:        addr,
 		serverURL:   serverURL,
 		privateKey:  privateKey,
-		packetChan:  make(chan Packet, 1000),
+		packetChan:  make(chan Packet, 50000), // Increased from 1000 to handle high throughput
 		ReachableAt: reachableAt,
 		ctx:         ctx,
 		cancel:      cancel,
@@ -189,8 +208,13 @@ func (s *UDPProxyServer) Start() error {
 	s.conn = conn
 	logger.Info("UDP server listening on %s", s.addr)
 
-	// Start a fixed number of worker goroutines.
-	workerCount := 10 // TODO: Make this configurable or pick it better!
+	// Start worker goroutines based on CPU cores for better parallelism
+	// At high throughput (160+ Mbps), we need many workers to avoid bottlenecks
+	workerCount := runtime.NumCPU() * 10
+	if workerCount < 20 {
+		workerCount = 20 // Minimum 20 workers
+	}
+	logger.Info("Starting %d packet workers (CPUs: %d)", workerCount, runtime.NumCPU())
 	for i := 0; i < workerCount; i++ {
 		go s.packetWorker()
 	}
@@ -209,6 +233,9 @@ func (s *UDPProxyServer) Start() error {
 
 	// Start the communication pattern cleanup routine
 	go s.cleanupIdleCommunicationPatterns()
+
+	// Start the hole punch rate limiter cleanup routine
+	go s.cleanupHolePunchRateLimiter()
 
 	return nil
 }
@@ -269,13 +296,40 @@ func (s *UDPProxyServer) packetWorker() {
 	for packet := range s.packetChan {
 		// Determine packet type by inspecting the first byte.
 		if packet.n > 0 && packet.data[0] >= 1 && packet.data[0] <= 4 {
+			metrics.RecordUDPPacket(relayIfname, "wireguard", "in")
+			metrics.RecordUDPPacketSize(relayIfname, "wireguard", float64(packet.n))
 			// Process as a WireGuard packet.
 			s.handleWireGuardPacket(packet.data, packet.remoteAddr)
 		} else {
+			metrics.RecordUDPPacket(relayIfname, "hole_punch", "in")
+			metrics.RecordUDPPacketSize(relayIfname, "hole_punch", float64(packet.n))
+			// Rate limit: allow at most 2 hole punch messages per IP:Port per second
+			rateLimitKey := packet.remoteAddr.String()
+			entryVal, _ := s.holePunchRateLimiter.LoadOrStore(rateLimitKey, &holePunchRateLimitEntry{
+				windowStart: time.Now(),
+			})
+			rlEntry := entryVal.(*holePunchRateLimitEntry)
+			rlEntry.mu.Lock()
+			now := time.Now()
+			if now.Sub(rlEntry.windowStart) >= time.Second {
+				rlEntry.count = 0
+				rlEntry.windowStart = now
+			}
+			rlEntry.count++
+			allowed := rlEntry.count <= 2
+			rlEntry.mu.Unlock()
+			if !allowed {
+				// logger.Debug("Rate limiting hole punch message from %s", rateLimitKey)
+				metrics.RecordHolePunchEvent(relayIfname, "rate_limited")
+				bufferPool.Put(packet.data[:1500])
+				continue
+			}
+
 			// Process as an encrypted hole punch message
 			var encMsg EncryptedHolePunchMessage
 			if err := json.Unmarshal(packet.data, &encMsg); err != nil {
 				logger.Error("Error unmarshaling encrypted message: %v", err)
+				metrics.RecordHolePunchEvent(relayIfname, "error")
 				// Return the buffer to the pool for reuse and continue with next packet
 				bufferPool.Put(packet.data[:1500])
 				continue
@@ -283,6 +337,7 @@ func (s *UDPProxyServer) packetWorker() {
 
 			if encMsg.EphemeralPublicKey == "" {
 				logger.Error("Received malformed message without ephemeral key")
+				metrics.RecordHolePunchEvent(relayIfname, "error")
 				// Return the buffer to the pool for reuse and continue with next packet
 				bufferPool.Put(packet.data[:1500])
 				continue
@@ -291,7 +346,8 @@ func (s *UDPProxyServer) packetWorker() {
 			// This appears to be an encrypted message
 			decryptedData, err := s.decryptMessage(encMsg)
 			if err != nil {
-				logger.Error("Failed to decrypt message: %v", err)
+				// logger.Error("Failed to decrypt message: %v", err)
+				metrics.RecordHolePunchEvent(relayIfname, "error")
 				// Return the buffer to the pool for reuse and continue with next packet
 				bufferPool.Put(packet.data[:1500])
 				continue
@@ -301,6 +357,7 @@ func (s *UDPProxyServer) packetWorker() {
 			var msg HolePunchMessage
 			if err := json.Unmarshal(decryptedData, &msg); err != nil {
 				logger.Error("Error unmarshaling decrypted message: %v", err)
+				metrics.RecordHolePunchEvent(relayIfname, "error")
 				// Return the buffer to the pool for reuse and continue with next packet
 				bufferPool.Put(packet.data[:1500])
 				continue
@@ -320,6 +377,7 @@ func (s *UDPProxyServer) packetWorker() {
 			logger.Debug("Created endpoint from packet remoteAddr %s: IP=%s, Port=%d", packet.remoteAddr.String(), endpoint.IP, endpoint.Port)
 			s.notifyServer(endpoint)
 			s.clearSessionsForIP(endpoint.IP) // Clear sessions for this IP to allow re-establishment
+			metrics.RecordHolePunchEvent(relayIfname, "success")
 		}
 		// Return the buffer to the pool for reuse.
 		bufferPool.Put(packet.data[:1500])
@@ -387,6 +445,8 @@ func (s *UDPProxyServer) fetchInitialMappings() error {
 		mapping.LastUsed = time.Now()
 		s.proxyMappings.Store(key, mapping)
 	}
+	metrics.RecordProxyInitialMappings(relayIfname, int64(len(initialMappings.Mappings)))
+	metrics.RecordProxyMapping(relayIfname, int64(len(initialMappings.Mappings)))
 	logger.Info("Loaded %d initial proxy mappings", len(initialMappings.Mappings))
 	return nil
 }
@@ -414,6 +474,43 @@ func extractWireGuardIndices(packet []byte) (uint32, uint32, bool) {
 	}
 
 	return 0, 0, false
+}
+
+// cachedAddr holds a resolved UDP address with TTL
+type cachedAddr struct {
+	addr      *net.UDPAddr
+	expiresAt time.Time
+}
+
+// addrCacheTTL is how long resolved addresses are cached before re-resolving
+const addrCacheTTL = 5 * time.Minute
+
+// getCachedAddr returns a cached UDP address or resolves and caches it.
+// This avoids per-packet DNS lookups which are a major throughput bottleneck.
+func (s *UDPProxyServer) getCachedAddr(ip string, port int) (*net.UDPAddr, error) {
+	key := fmt.Sprintf("%s:%d", ip, port)
+
+	// Check cache first
+	if cached, ok := s.addrCache.Load(key); ok {
+		entry := cached.(*cachedAddr)
+		if time.Now().Before(entry.expiresAt) {
+			return entry.addr, nil
+		}
+		// Cache expired, delete and re-resolve
+		s.addrCache.Delete(key)
+	}
+
+	// Resolve and cache
+	addr, err := net.ResolveUDPAddr("udp", key)
+	if err != nil {
+		return nil, err
+	}
+
+	s.addrCache.Store(key, &cachedAddr{
+		addr:      addr,
+		expiresAt: time.Now().Add(addrCacheTTL),
+	})
+	return addr, nil
 }
 
 // Updated to handle multi-peer WireGuard communication
@@ -450,7 +547,7 @@ func (s *UDPProxyServer) handleWireGuardPacket(packet []byte, remoteAddr *net.UD
 		logger.Debug("Forwarding handshake initiation from %s (sender index: %d) to peers %v", remoteAddr, senderIndex, proxyMapping.Destinations)
 
 		for _, dest := range proxyMapping.Destinations {
-			destAddr, err := net.ResolveUDPAddr("udp", fmt.Sprintf("%s:%d", dest.DestinationIP, dest.DestinationPort))
+			destAddr, err := s.getCachedAddr(dest.DestinationIP, dest.DestinationPort)
 			if err != nil {
 				logger.Error("Failed to resolve destination address: %v", err)
 				continue
@@ -465,7 +562,11 @@ func (s *UDPProxyServer) handleWireGuardPacket(packet []byte, remoteAddr *net.UD
 			_, err = conn.Write(packet)
 			if err != nil {
 				logger.Debug("Failed to forward handshake initiation: %v", err)
+				metrics.RecordProxyConnectionError(relayIfname, "write_udp")
+				continue
 			}
+			metrics.RecordUDPPacket(relayIfname, "wireguard", "out")
+			metrics.RecordUDPPacketSize(relayIfname, "wireguard", float64(len(packet)))
 		}
 
 	case WireGuardMessageTypeHandshakeResponse:
@@ -477,16 +578,23 @@ func (s *UDPProxyServer) handleWireGuardPacket(packet []byte, remoteAddr *net.UD
 		sessionKey := fmt.Sprintf("%d:%d", receiverIndex, senderIndex)
 
 		// Store the session information
-		s.wgSessions.Store(sessionKey, &WireGuardSession{
+		session := &WireGuardSession{
 			ReceiverIndex: receiverIndex,
 			SenderIndex:   senderIndex,
 			DestAddr:      remoteAddr,
 			LastSeen:      time.Now(),
-		})
+		}
+		if _, loaded := s.wgSessions.LoadOrStore(sessionKey, session); loaded {
+			s.wgSessions.Store(sessionKey, session)
+		} else {
+			metrics.RecordSession(relayIfname, 1)
+		}
+		// Also index by sender index for O(1) lookup in transport data path
+		s.sessionsByReceiverIndex.Store(senderIndex, session)
 
 		// Forward the response to the original sender
 		for _, dest := range proxyMapping.Destinations {
-			destAddr, err := net.ResolveUDPAddr("udp", fmt.Sprintf("%s:%d", dest.DestinationIP, dest.DestinationPort))
+			destAddr, err := s.getCachedAddr(dest.DestinationIP, dest.DestinationPort)
 			if err != nil {
 				logger.Error("Failed to resolve destination address: %v", err)
 				continue
@@ -501,28 +609,26 @@ func (s *UDPProxyServer) handleWireGuardPacket(packet []byte, remoteAddr *net.UD
 			_, err = conn.Write(packet)
 			if err != nil {
 				logger.Error("Failed to forward handshake response: %v", err)
+				metrics.RecordProxyConnectionError(relayIfname, "write_udp")
+				continue
 			}
+			metrics.RecordUDPPacket(relayIfname, "wireguard", "out")
+			metrics.RecordUDPPacketSize(relayIfname, "wireguard", float64(len(packet)))
 		}
 
 	case WireGuardMessageTypeTransportData:
 		// Data packet: forward only to the established session peer
 		// logger.Debug("Received transport data with receiver index %d from %s", receiverIndex, remoteAddr)
 
-		// Look up the session based on the receiver index
+		// Look up the session based on the receiver index - O(1) lookup instead of O(n) Range
 		var destAddr *net.UDPAddr
 
-		// First check for existing sessions to see if we know where to send this packet
-		s.wgSessions.Range(func(k, v interface{}) bool {
-			session := v.(*WireGuardSession)
-			// Check if session matches (read lock for check)
-			if session.GetSenderIndex() == receiverIndex {
-				// Found matching session - get dest addr and update last seen
-				destAddr = session.GetDestAddr()
-				session.UpdateLastSeen()
-				return false // stop iteration
-			}
-			return true // continue iteration
-		})
+		// Fast path: direct index lookup by receiver index
+		if sessionObj, ok := s.sessionsByReceiverIndex.Load(receiverIndex); ok {
+			session := sessionObj.(*WireGuardSession)
+			destAddr = session.GetDestAddr()
+			session.UpdateLastSeen()
+		}
 
 		if destAddr != nil {
 			// We found a specific peer to forward to
@@ -538,12 +644,16 @@ func (s *UDPProxyServer) handleWireGuardPacket(packet []byte, remoteAddr *net.UD
 			_, err = conn.Write(packet)
 			if err != nil {
 				logger.Debug("Failed to forward transport data: %v", err)
+				metrics.RecordProxyConnectionError(relayIfname, "write_udp")
+				return
 			}
+			metrics.RecordUDPPacket(relayIfname, "wireguard", "out")
+			metrics.RecordUDPPacketSize(relayIfname, "wireguard", float64(len(packet)))
 		} else {
 			// No known session, fall back to forwarding to all peers
 			logger.Debug("No session found for receiver index %d, forwarding to all destinations", receiverIndex)
 			for _, dest := range proxyMapping.Destinations {
-				destAddr, err := net.ResolveUDPAddr("udp", fmt.Sprintf("%s:%d", dest.DestinationIP, dest.DestinationPort))
+				destAddr, err := s.getCachedAddr(dest.DestinationIP, dest.DestinationPort)
 				if err != nil {
 					logger.Error("Failed to resolve destination address: %v", err)
 					continue
@@ -561,7 +671,11 @@ func (s *UDPProxyServer) handleWireGuardPacket(packet []byte, remoteAddr *net.UD
 				_, err = conn.Write(packet)
 				if err != nil {
 					logger.Debug("Failed to forward transport data: %v", err)
+					metrics.RecordProxyConnectionError(relayIfname, "write_udp")
+					continue
 				}
+				metrics.RecordUDPPacket(relayIfname, "wireguard", "out")
+				metrics.RecordUDPPacketSize(relayIfname, "wireguard", float64(len(packet)))
 			}
 		}
 
@@ -571,7 +685,7 @@ func (s *UDPProxyServer) handleWireGuardPacket(packet []byte, remoteAddr *net.UD
 
 		// Forward to all peers
 		for _, dest := range proxyMapping.Destinations {
-			destAddr, err := net.ResolveUDPAddr("udp", fmt.Sprintf("%s:%d", dest.DestinationIP, dest.DestinationPort))
+			destAddr, err := s.getCachedAddr(dest.DestinationIP, dest.DestinationPort)
 			if err != nil {
 				logger.Error("Failed to resolve destination address: %v", err)
 				continue
@@ -586,7 +700,11 @@ func (s *UDPProxyServer) handleWireGuardPacket(packet []byte, remoteAddr *net.UD
 			_, err = conn.Write(packet)
 			if err != nil {
 				logger.Error("Failed to forward WireGuard packet: %v", err)
+				metrics.RecordProxyConnectionError(relayIfname, "write_udp")
+				continue
 			}
+			metrics.RecordUDPPacket(relayIfname, "wireguard", "out")
+			metrics.RecordUDPPacketSize(relayIfname, "wireguard", float64(len(packet)))
 		}
 	}
 }
@@ -604,6 +722,7 @@ func (s *UDPProxyServer) getOrCreateConnection(destAddr *net.UDPAddr, remoteAddr
 	// Create new connection
 	newConn, err := net.DialUDP("udp", nil, destAddr)
 	if err != nil {
+		metrics.RecordProxyConnectionError(relayIfname, "dial_udp")
 		return nil, fmt.Errorf("failed to create UDP connection: %v", err)
 	}
 
@@ -627,6 +746,8 @@ func (s *UDPProxyServer) handleResponses(conn *net.UDPConn, destAddr *net.UDPAdd
 			logger.Debug("Error reading response from %s: %v", destAddr.String(), err)
 			return
 		}
+		metrics.RecordUDPPacket(relayIfname, "wireguard", "in")
+		metrics.RecordUDPPacketSize(relayIfname, "wireguard", float64(n))
 
 		// Process the response to track sessions if it's a WireGuard packet
 		if n > 0 && buffer[0] >= 1 && buffer[0] <= 4 {
@@ -634,12 +755,19 @@ func (s *UDPProxyServer) handleResponses(conn *net.UDPConn, destAddr *net.UDPAdd
 			if ok && buffer[0] == WireGuardMessageTypeHandshakeResponse {
 				// Store the session mapping for the handshake response
 				sessionKey := fmt.Sprintf("%d:%d", senderIndex, receiverIndex)
-				s.wgSessions.Store(sessionKey, &WireGuardSession{
+				session := &WireGuardSession{
 					ReceiverIndex: receiverIndex,
 					SenderIndex:   senderIndex,
 					DestAddr:      destAddr,
 					LastSeen:      time.Now(),
-				})
+				}
+				if _, loaded := s.wgSessions.LoadOrStore(sessionKey, session); loaded {
+					s.wgSessions.Store(sessionKey, session)
+				} else {
+					metrics.RecordSession(relayIfname, 1)
+				}
+				// Also index by sender index for O(1) lookup
+				s.sessionsByReceiverIndex.Store(senderIndex, session)
 				logger.Debug("Stored session mapping: %s -> %s", sessionKey, destAddr.String())
 			} else if ok && buffer[0] == WireGuardMessageTypeTransportData {
 				// Track communication pattern for session rebuilding (reverse direction)
@@ -651,7 +779,11 @@ func (s *UDPProxyServer) handleResponses(conn *net.UDPConn, destAddr *net.UDPAdd
 		_, err = s.conn.WriteToUDP(buffer[:n], remoteAddr)
 		if err != nil {
 			logger.Error("Failed to forward response: %v", err)
+			metrics.RecordProxyConnectionError(relayIfname, "write_udp")
+			continue
 		}
+		metrics.RecordUDPPacket(relayIfname, "wireguard", "out")
+		metrics.RecordUDPPacketSize(relayIfname, "wireguard", float64(n))
 	}
 }
 
@@ -662,15 +794,18 @@ func (s *UDPProxyServer) cleanupIdleConnections() {
 	for {
 		select {
 		case <-ticker.C:
+			cleanupStart := time.Now()
 			now := time.Now()
 			s.connections.Range(func(key, value interface{}) bool {
 				destConn := value.(*DestinationConn)
 				if now.Sub(destConn.lastUsed) > 10*time.Minute {
 					destConn.conn.Close()
 					s.connections.Delete(key)
+					metrics.RecordProxyCleanupRemoved(relayIfname, "conn", 1)
 				}
 				return true
 			})
+			metrics.RecordProxyIdleCleanupDuration(relayIfname, "conn", time.Since(cleanupStart).Seconds())
 		case <-s.ctx.Done():
 			return
 		}
@@ -685,16 +820,20 @@ func (s *UDPProxyServer) cleanupIdleSessions() {
 	for {
 		select {
 		case <-ticker.C:
+			cleanupStart := time.Now()
 			now := time.Now()
 			s.wgSessions.Range(func(key, value interface{}) bool {
 				session := value.(*WireGuardSession)
 				// Use thread-safe method to read LastSeen
 				if now.Sub(session.GetLastSeen()) > 15*time.Minute {
 					s.wgSessions.Delete(key)
+					metrics.RecordSession(relayIfname, -1)
+					metrics.RecordProxyCleanupRemoved(relayIfname, "session", 1)
 					logger.Debug("Removed idle session: %s", key)
 				}
 				return true
 			})
+			metrics.RecordProxyIdleCleanupDuration(relayIfname, "session", time.Since(cleanupStart).Seconds())
 		case <-s.ctx.Done():
 			return
 		}
@@ -708,16 +847,20 @@ func (s *UDPProxyServer) cleanupIdleProxyMappings() {
 	for {
 		select {
 		case <-ticker.C:
+			cleanupStart := time.Now()
 			now := time.Now()
 			s.proxyMappings.Range(func(key, value interface{}) bool {
 				mapping := value.(ProxyMapping)
 				// Remove mappings that haven't been used in 30 minutes
 				if now.Sub(mapping.LastUsed) > 30*time.Minute {
 					s.proxyMappings.Delete(key)
+					metrics.RecordProxyMapping(relayIfname, -1)
+					metrics.RecordProxyCleanupRemoved(relayIfname, "proxy_mapping", 1)
 					logger.Debug("Removed idle proxy mapping: %s", key)
 				}
 				return true
 			})
+			metrics.RecordProxyIdleCleanupDuration(relayIfname, "proxy_mapping", time.Since(cleanupStart).Seconds())
 		case <-s.ctx.Done():
 			return
 		}
@@ -760,6 +903,11 @@ func (s *UDPProxyServer) notifyServer(endpoint ClientEndpoint) {
 	key := fmt.Sprintf("%s:%d", endpoint.IP, endpoint.Port)
 	logger.Debug("About to store proxy mapping with key: %s (from endpoint IP=%s, Port=%d)", key, endpoint.IP, endpoint.Port)
 	mapping.LastUsed = time.Now()
+	if _, existed := s.proxyMappings.Load(key); existed {
+		metrics.RecordProxyMappingUpdate(relayIfname)
+	} else {
+		metrics.RecordProxyMapping(relayIfname, 1)
+	}
 	s.proxyMappings.Store(key, mapping)
 
 	logger.Debug("Stored proxy mapping for %s with %d destinations (timestamp: %v)", key, len(mapping.Destinations), mapping.LastUsed)
@@ -771,6 +919,11 @@ func (s *UDPProxyServer) UpdateProxyMapping(sourceIP string, sourcePort int, des
 	mapping := ProxyMapping{
 		Destinations: destinations,
 		LastUsed:     time.Now(),
+	}
+	if _, existed := s.proxyMappings.Load(key); existed {
+		metrics.RecordProxyMappingUpdate(relayIfname)
+	} else {
+		metrics.RecordProxyMapping(relayIfname, 1)
 	}
 	s.proxyMappings.Store(key, mapping)
 }
@@ -837,6 +990,10 @@ func (s *UDPProxyServer) clearSessionsForIP(ip string) {
 	// Delete the sessions
 	for _, key := range keysToDelete {
 		s.wgSessions.Delete(key)
+	}
+	if len(keysToDelete) > 0 {
+		metrics.RecordSession(relayIfname, -int64(len(keysToDelete)))
+		metrics.RecordProxyCleanupRemoved(relayIfname, "session", int64(len(keysToDelete)))
 	}
 
 	logger.Debug("Cleared %d sessions for WG IP: %s", len(keysToDelete), ip)
@@ -998,7 +1155,9 @@ func (s *UDPProxyServer) trackCommunicationPattern(fromAddr, toAddr *net.UDPAddr
 			pattern.LastFromDest = now
 		}
 
-		s.commPatterns.Store(patternKey, pattern)
+		if _, loaded := s.commPatterns.LoadOrStore(patternKey, pattern); !loaded {
+			metrics.RecordCommPattern(relayIfname, 1)
+		}
 	}
 }
 
@@ -1016,26 +1175,55 @@ func (s *UDPProxyServer) tryRebuildSession(pattern *CommunicationPattern) {
 		sessionKey := fmt.Sprintf("%d:%d", pattern.DestIndex, pattern.ClientIndex)
 
 		// Check if we already have this session
-		if _, exists := s.wgSessions.Load(sessionKey); !exists {
-			s.wgSessions.Store(sessionKey, &WireGuardSession{
-				ReceiverIndex: pattern.DestIndex,
-				SenderIndex:   pattern.ClientIndex,
-				DestAddr:      pattern.ToDestination,
-				LastSeen:      time.Now(),
-			})
-			logger.Info("Rebuilt WireGuard session from communication pattern: %s -> %s (packets: %d)",
-				sessionKey, pattern.ToDestination.String(), pattern.PacketCount)
+		session := &WireGuardSession{
+			ReceiverIndex: pattern.DestIndex,
+			SenderIndex:   pattern.ClientIndex,
+			DestAddr:      pattern.ToDestination,
+			LastSeen:      time.Now(),
 		}
+		if _, loaded := s.wgSessions.LoadOrStore(sessionKey, session); loaded {
+			s.wgSessions.Store(sessionKey, session)
+		} else {
+			metrics.RecordSession(relayIfname, 1)
+			metrics.RecordSessionRebuilt(relayIfname)
+		}
+		logger.Info("Rebuilt WireGuard session from communication pattern: %s -> %s (packets: %d)",
+			sessionKey, pattern.ToDestination.String(), pattern.PacketCount)
 	}
 }
 
 // cleanupIdleCommunicationPatterns periodically removes idle communication patterns
+// cleanupHolePunchRateLimiter periodically evicts stale rate limit entries to prevent unbounded growth.
+func (s *UDPProxyServer) cleanupHolePunchRateLimiter() {
+	ticker := time.NewTicker(30 * time.Second)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ticker.C:
+			now := time.Now()
+			s.holePunchRateLimiter.Range(func(key, value interface{}) bool {
+				rlEntry := value.(*holePunchRateLimitEntry)
+				rlEntry.mu.Lock()
+				stale := now.Sub(rlEntry.windowStart) > 10*time.Second
+				rlEntry.mu.Unlock()
+				if stale {
+					s.holePunchRateLimiter.Delete(key)
+				}
+				return true
+			})
+		case <-s.ctx.Done():
+			return
+		}
+	}
+}
+
 func (s *UDPProxyServer) cleanupIdleCommunicationPatterns() {
 	ticker := time.NewTicker(10 * time.Minute)
 	defer ticker.Stop()
 	for {
 		select {
 		case <-ticker.C:
+			cleanupStart := time.Now()
 			now := time.Now()
 			s.commPatterns.Range(func(key, value interface{}) bool {
 				pattern := value.(*CommunicationPattern)
@@ -1049,10 +1237,13 @@ func (s *UDPProxyServer) cleanupIdleCommunicationPatterns() {
 				// Remove patterns that haven't had activity in 20 minutes
 				if now.Sub(lastActivity) > 20*time.Minute {
 					s.commPatterns.Delete(key)
+					metrics.RecordCommPattern(relayIfname, -1)
+					metrics.RecordProxyCleanupRemoved(relayIfname, "comm_pattern", 1)
 					logger.Debug("Removed idle communication pattern: %s", key)
 				}
 				return true
 			})
+			metrics.RecordProxyIdleCleanupDuration(relayIfname, "comm_pattern", time.Since(cleanupStart).Seconds())
 		case <-s.ctx.Done():
 			return
 		}

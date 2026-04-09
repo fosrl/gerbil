@@ -1,0 +1,24 @@
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+  external_labels:
+    cluster: 'gerbil-dev'
+
+scrape_configs:
+  # Scrape Gerbil's /metrics endpoint directly
+  - job_name: 'gerbil'
+    static_configs:
+      - targets: ['gerbil:3003']
+        labels:
+          service: 'gerbil'
+          environment: 'development'
+
+  # Scrape OpenTelemetry Collector metrics
+  - job_name: 'otel-collector'
+    static_configs:
+      - targets: ['otel-collector:8888']
+        labels:
+          service: 'otel-collector'
+      - targets: ['otel-collector:8889']
+        labels:
+          service: 'otel-collector-prometheus-exporter'

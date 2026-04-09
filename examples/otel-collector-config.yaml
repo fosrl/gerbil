@@ -1,0 +1,46 @@
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+      http:
+        endpoint: 0.0.0.0:4318
+
+processors:
+  batch:
+    timeout: 10s
+    send_batch_size: 1024
+  
+  # Add resource attributes
+  resource:
+    attributes:
+      - key: service.environment
+        value: "development"
+        action: insert
+
+exporters:
+  # Prometheus exporter for scraping
+  prometheus:
+    endpoint: "0.0.0.0:8889"
+    namespace: "gerbil"
+    send_timestamps: true
+    metric_expiration: 5m
+    resource_to_telemetry_conversion:
+      enabled: true
+
+  # Prometheus remote write (optional)
+  prometheusremotewrite:
+    endpoint: "http://prometheus:9090/api/v1/write"
+    tls:
+      insecure: true
+  
+  # Debug exporter for debugging
+  debug:
+    verbosity: normal
+
+service:
+  pipelines:
+    metrics:
+      receivers: [otlp]
+      processors: [batch, resource]
+      exporters: [prometheus, prometheusremotewrite, debug]
