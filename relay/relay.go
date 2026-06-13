@@ -416,10 +416,22 @@ func (s *UDPProxyServer) packetWorker() {
 				PublicKey: endpoint.ClientPublicKey,
 			}
 			if cached, ok := s.lastEndpointCache.Load(cacheKey); ok && cached.(cachedEndpointState) == newState {
-				// Endpoint unchanged - skip the HTTP call but still clear stale sessions.
-				logger.Debug("Endpoint unchanged for %s, skipping notification", cacheKey)
+				// Endpoint unchanged - skip the HTTP call for this packet but
+				// still clear stale sessions, and invalidate the cache entry so
+				// the next hole-punch re-notifies the server.
+				//
+				// A reconnecting client (e.g. olm) commonly presents the same
+				// endpoint (same NAT IP:port + persistent public key/token) while
+				// the server has already torn down its session on disconnect. If
+				// we keep skipping notifyServer() in that case, the server never
+				// re-registers the client and never returns a fresh ProxyMapping,
+				// leaving the client stuck "connected but not registered".
+				// Dropping the cache entry here lets the next hole-punch fall
+				// through to notifyServer() and re-establish routing.
+				logger.Debug("Endpoint unchanged for %s, clearing sessions and invalidating cache for re-registration", cacheKey)
 				metrics.RecordHolePunchEvent(relayIfname, "deduplicated")
 				s.clearSessionsForIP(endpoint.IP)
+				s.lastEndpointCache.Delete(cacheKey)
 				metrics.RecordHolePunchEvent(relayIfname, "success")
 				bufferPool.Put(packet.data[:1500])
 				continue
