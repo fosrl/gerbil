@@ -17,7 +17,7 @@ COPY . .
 RUN CGO_ENABLED=0 GOOS=linux go build -o /gerbil
 
 # Start a new stage from scratch
-FROM alpine:3.23 AS runner
+FROM alpine:3.24 AS runner
 
 RUN apk add --no-cache iptables iproute2
 
