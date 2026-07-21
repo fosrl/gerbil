@@ -205,6 +205,10 @@ type UDPProxyServer struct {
 	packetChan      chan Packet
 	ctx             context.Context
 	cancel          context.CancelFunc
+	// stopOnce ensures Stop() is idempotent: packetChan is closed at most once
+	// even when Stop() is called concurrently or multiple times (e.g. via both
+	// defer and the shutdown goroutine in main).
+	stopOnce sync.Once
 
 	// Session tracking for WireGuard peers
 	// Key format: "senderIndex:receiverIndex"
@@ -305,28 +309,30 @@ func (s *UDPProxyServer) Start() error {
 	return nil
 }
 
+// Stop shuts down the UDPProxyServer. It is safe to call multiple times
+// and from concurrent goroutines; the internal cleanup runs at most once.
 func (s *UDPProxyServer) Stop() {
-	// Signal all background goroutines to stop
-	if s.cancel != nil {
-		s.cancel()
-	}
-	// Close listener to unblock reads
-	if s.conn != nil {
-		_ = s.conn.Close()
-	}
-	// Close all downstream UDP connections
-	s.connections.Range(func(key, value interface{}) bool {
-		if dc, ok := value.(*DestinationConn); ok && dc.conn != nil {
-			_ = dc.conn.Close()
+	s.stopOnce.Do(func() {
+		// Signal all background goroutines to stop
+		if s.cancel != nil {
+			s.cancel()
 		}
-		return true
+		// Close listener to unblock reads
+		if s.conn != nil {
+			_ = s.conn.Close()
+		}
+		// Close all downstream UDP connections
+		s.connections.Range(func(key, value interface{}) bool {
+			if dc, ok := value.(*DestinationConn); ok && dc.conn != nil {
+				_ = dc.conn.Close()
+			}
+			return true
+		})
+		// Close packet channel to unblock and stop all packetWorker goroutines.
+		// This must happen after cancel() so that readPackets() exits cleanly
+		// and no further sends to packetChan occur before we close it.
+		close(s.packetChan)
 	})
-	// Close packet channel to stop workers
-	select {
-	case <-s.ctx.Done():
-	default:
-	}
-	close(s.packetChan)
 }
 
 // readPackets continuously reads from the UDP socket and pushes packets into the channel.
