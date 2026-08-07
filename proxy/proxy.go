@@ -1,9 +1,10 @@
 package proxy
 
 import (
+	"bufio"
 	"bytes"
 	"context"
-	"crypto/tls"
+	"encoding/binary"
 	"encoding/json"
 	"fmt"
 	"hash/fnv"
@@ -11,6 +12,7 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -19,6 +21,7 @@ import (
 	"github.com/fosrl/gerbil/internal/metrics"
 	"github.com/fosrl/gerbil/logger"
 	"github.com/patrickmn/go-cache"
+	"golang.org/x/crypto/cryptobyte"
 )
 
 // RouteRecord represents a routing configuration
@@ -81,20 +84,6 @@ type SNIProxy struct {
 type activeTunnel struct {
 	conns []net.Conn
 }
-
-// readOnlyConn is a wrapper for io.Reader that implements net.Conn
-type readOnlyConn struct {
-	reader io.Reader
-}
-
-func (conn readOnlyConn) Read(p []byte) (int, error)         { return conn.reader.Read(p) }
-func (conn readOnlyConn) Write(p []byte) (int, error)        { return 0, io.ErrClosedPipe }
-func (conn readOnlyConn) Close() error                       { return nil }
-func (conn readOnlyConn) LocalAddr() net.Addr                { return nil }
-func (conn readOnlyConn) RemoteAddr() net.Addr               { return nil }
-func (conn readOnlyConn) SetDeadline(t time.Time) error      { return nil }
-func (conn readOnlyConn) SetReadDeadline(t time.Time) error  { return nil }
-func (conn readOnlyConn) SetWriteDeadline(t time.Time) error { return nil }
 
 // parseProxyProtocolHeader parses a PROXY protocol v1 header from the connection
 func (p *SNIProxy) parseProxyProtocolHeader(conn net.Conn) (*ProxyProtocolInfo, net.Conn, error) {
@@ -444,6 +433,12 @@ func (p *SNIProxy) Stop() error {
 	return nil
 }
 
+const (
+	tlsRecordTypeHandshake      = 22
+	tlsHandshakeTypeClientHello = 1
+	maxClientHelloBytes         = 64 * 1024
+)
+
 // acceptConnections handles incoming connections
 func (p *SNIProxy) acceptConnections() {
 	for {
@@ -463,44 +458,154 @@ func (p *SNIProxy) acceptConnections() {
 	}
 }
 
-// readClientHello reads and parses the TLS ClientHello message
-func (p *SNIProxy) readClientHello(reader io.Reader) (*tls.ClientHelloInfo, error) {
-	var hello *tls.ClientHelloInfo
-	err := tls.Server(readOnlyConn{reader: reader}, &tls.Config{
-		GetConfigForClient: func(argHello *tls.ClientHelloInfo) (*tls.Config, error) {
-			hello = new(tls.ClientHelloInfo)
-			*hello = *argHello
-			return nil, nil
-		},
-	}).Handshake()
-	if hello == nil {
-		return nil, err
+func parseClientHelloServerName(clientHello []byte) (string, error) {
+	s := cryptobyte.String(clientHello)
+
+	var legacyVersion uint16
+	if !s.ReadUint16(&legacyVersion) {
+		return "", fmt.Errorf("client hello missing legacy version")
 	}
-	return hello, nil
+
+	var random []byte
+	if !s.ReadBytes(&random, 32) {
+		return "", fmt.Errorf("client hello missing random")
+	}
+
+	var sessionID cryptobyte.String
+	if !s.ReadUint8LengthPrefixed(&sessionID) {
+		return "", fmt.Errorf("client hello missing session id")
+	}
+
+	var cipherSuites cryptobyte.String
+	if !s.ReadUint16LengthPrefixed(&cipherSuites) {
+		return "", fmt.Errorf("client hello missing cipher suites")
+	}
+
+	var compressionMethods cryptobyte.String
+	if !s.ReadUint8LengthPrefixed(&compressionMethods) {
+		return "", fmt.Errorf("client hello missing compression methods")
+	}
+
+	var extensions cryptobyte.String
+	if !s.ReadUint16LengthPrefixed(&extensions) {
+		return "", fmt.Errorf("client hello missing extensions")
+	}
+	if !s.Empty() {
+		return "", fmt.Errorf("client hello has trailing data")
+	}
+
+	for !extensions.Empty() {
+		var extensionType uint16
+		var extensionData cryptobyte.String
+		if !extensions.ReadUint16(&extensionType) || !extensions.ReadUint16LengthPrefixed(&extensionData) {
+			return "", fmt.Errorf("invalid client hello extension")
+		}
+
+		if extensionType != 0 {
+			continue
+		}
+
+		var serverNameList cryptobyte.String
+		if !extensionData.ReadUint16LengthPrefixed(&serverNameList) {
+			return "", fmt.Errorf("invalid server name extension")
+		}
+
+		serverName := ""
+		for !serverNameList.Empty() {
+			var nameType uint8
+			var hostName cryptobyte.String
+			if !serverNameList.ReadUint8(&nameType) || !serverNameList.ReadUint16LengthPrefixed(&hostName) {
+				return "", fmt.Errorf("invalid server name entry")
+			}
+
+			// host_name (RFC 6066); keep parsing to allow additional entries.
+			if nameType == 0 && len(hostName) > 0 && serverName == "" {
+				serverName = strings.TrimSuffix(strings.ToLower(string(hostName)), ".")
+			}
+		}
+
+		if !extensionData.Empty() {
+			return "", fmt.Errorf("server name extension payload has trailing data")
+		}
+		if serverName == "" {
+			return "", fmt.Errorf("no host_name entry found in server name extension")
+		}
+		return serverName, nil
+	}
+
+	return "", fmt.Errorf("SNI extension not present in ClientHello")
 }
 
 // peekClientHello reads the ClientHello while preserving the data for forwarding
-func (p *SNIProxy) peekClientHello(reader io.Reader) (*tls.ClientHelloInfo, io.Reader, error) {
-	peekedBytes := new(bytes.Buffer)
-	hello, err := p.readClientHello(io.TeeReader(reader, peekedBytes))
-	if err != nil {
-		return nil, nil, err
+func (p *SNIProxy) peekClientHello(reader io.Reader) (string, io.Reader, error) {
+	bufferedReader := bufio.NewReader(reader)
+	peekedBytes := make([]byte, 0, 4096)
+	handshakeBytes := make([]byte, 0, 4096)
+	expectedClientHelloLen := -1
+
+	for {
+		var recordHeader [5]byte
+		if _, err := io.ReadFull(bufferedReader, recordHeader[:]); err != nil {
+			return "", nil, err
+		}
+		peekedBytes = append(peekedBytes, recordHeader[:]...)
+
+		if recordHeader[0] != tlsRecordTypeHandshake {
+			return "", nil, fmt.Errorf("unexpected TLS record type %d", recordHeader[0])
+		}
+
+		recordLen := int(binary.BigEndian.Uint16(recordHeader[3:5]))
+		if recordLen == 0 {
+			return "", nil, fmt.Errorf("empty TLS handshake record")
+		}
+		if len(handshakeBytes)+recordLen > maxClientHelloBytes {
+			return "", nil, fmt.Errorf("client hello handshake bytes exceed %d", maxClientHelloBytes)
+		}
+
+		recordPayloadOffset := len(peekedBytes)
+		peekedBytes = slices.Grow(peekedBytes, recordLen)
+		peekedBytes = peekedBytes[:recordPayloadOffset+recordLen]
+		if _, err := io.ReadFull(bufferedReader, peekedBytes[recordPayloadOffset:]); err != nil {
+			return "", nil, err
+		}
+
+		handshakeBytes = append(handshakeBytes, peekedBytes[recordPayloadOffset:]...)
+		if expectedClientHelloLen < 0 {
+			if len(handshakeBytes) < 4 {
+				continue
+			}
+			if handshakeBytes[0] != tlsHandshakeTypeClientHello {
+				return "", nil, fmt.Errorf("unexpected TLS handshake type %d", handshakeBytes[0])
+			}
+			expectedClientHelloLen = int(handshakeBytes[1])<<16 | int(handshakeBytes[2])<<8 | int(handshakeBytes[3])
+			if expectedClientHelloLen == 0 {
+				return "", nil, fmt.Errorf("empty TLS client hello")
+			}
+			if expectedClientHelloLen > maxClientHelloBytes-4 {
+				return "", nil, fmt.Errorf("client hello payload exceeds %d bytes", maxClientHelloBytes-4)
+			}
+		}
+
+		if len(handshakeBytes)-4 < expectedClientHelloLen {
+			continue
+		}
+
+		serverName, err := parseClientHelloServerName(handshakeBytes[4 : 4+expectedClientHelloLen])
+		if err != nil {
+			return "", nil, err
+		}
+
+		return serverName, io.MultiReader(bytes.NewReader(peekedBytes), bufferedReader), nil
 	}
-	return hello, io.MultiReader(peekedBytes, reader), nil
 }
 
 // extractSNI extracts the SNI hostname from the TLS ClientHello
 func (p *SNIProxy) extractSNI(conn net.Conn) (string, io.Reader, error) {
-	clientHello, clientReader, err := p.peekClientHello(conn)
+	hostname, clientReader, err := p.peekClientHello(conn)
 	if err != nil {
 		return "", nil, fmt.Errorf("failed to peek ClientHello: %w", err)
 	}
-
-	if clientHello.ServerName == "" {
-		return "", clientReader, fmt.Errorf("no SNI hostname found in ClientHello")
-	}
-
-	return clientHello.ServerName, clientReader, nil
+	return hostname, clientReader, nil
 }
 
 // handleConnection processes a single client connection
