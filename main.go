@@ -45,6 +45,7 @@ var (
 	wgMu             sync.Mutex // Protects WireGuard operations
 	notifyURL        string
 	proxyRelay       *relay.UDPProxyServer
+	proxyWssRelay    *relay.WssRelayServer
 	proxySNI         *proxy.SNIProxy
 	doTrafficShaping bool
 	bandwidthLimit   string
@@ -311,6 +312,7 @@ func main() {
 		logLevel             string
 		mtu                  string
 		sniProxyPort         int
+		wssRelayPort         int
 		localProxyAddr       string
 		localProxyPort       int
 		localOverridesStr    string
@@ -433,6 +435,7 @@ func main() {
 	if sniProxyPortStr == "" {
 		flag.IntVar(&sniProxyPort, "sni-port", 8443, "Port to listen on")
 	}
+	flag.IntVar(&wssRelayPort, "wss-relay-port", 4430, "Port for internal WSS relay bridge listener")
 
 	if localProxyAddr == "" {
 		flag.StringVar(&localProxyAddr, "local-proxy", "localhost", "Local proxy address")
@@ -682,6 +685,13 @@ func main() {
 	}
 	defer proxyRelay.Stop()
 
+	proxyWssRelay = relay.NewWssRelayServer(groupCtx, fmt.Sprintf(":%d", wssRelayPort), proxyRelay)
+	err = proxyWssRelay.Start()
+	if err != nil {
+		logger.Fatal("Failed to start WSS relay server: %v", err)
+	}
+	defer proxyWssRelay.Stop()
+
 	// TODO: WE SHOULD PULL THIS OUT OF THE CONFIG OR SOMETHING
 	// 		 SO YOU DON'T NEED TO SET THIS SEPARATELY
 	// Parse local overrides
@@ -755,6 +765,9 @@ func main() {
 		}
 		if proxyRelay != nil {
 			proxyRelay.Stop()
+		}
+		if proxyWssRelay != nil {
+			proxyWssRelay.Stop()
 		}
 		return nil
 	})
