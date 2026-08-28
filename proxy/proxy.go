@@ -21,6 +21,7 @@ import (
 	"github.com/fosrl/gerbil/internal/metrics"
 	"github.com/fosrl/gerbil/logger"
 	"github.com/patrickmn/go-cache"
+	"golang.org/x/sync/errgroup"
 )
 
 // defaultMaxSNIConnections caps the number of concurrent client connections
@@ -133,7 +134,9 @@ type SNIProxy struct {
 }
 
 type activeTunnel struct {
-	conns []net.Conn
+	ctx    context.Context
+	cancel context.CancelFunc
+	count  int // protected by activeTunnelsLock
 }
 
 // readOnlyConn is a wrapper for io.Reader that implements net.Conn
@@ -713,37 +716,32 @@ func (p *SNIProxy) handleConnection(clientConn net.Conn) {
 		}
 	}
 
-	// Track this tunnel by SNI
+	// Track this tunnel by SNI using context for cancellation
 	p.activeTunnelsLock.Lock()
 	tunnel, ok := p.activeTunnels[hostname]
 	if !ok {
-		tunnel = &activeTunnel{}
+		ctx, cancel := context.WithCancel(p.ctx)
+		tunnel = &activeTunnel{ctx: ctx, cancel: cancel}
 		p.activeTunnels[hostname] = tunnel
 	}
-	tunnel.conns = append(tunnel.conns, actualClientConn)
+	tunnel.count++
+	tunnelCtx := tunnel.ctx
 	p.activeTunnelsLock.Unlock()
 
 	defer func() {
-		// Remove this conn from active tunnels
 		p.activeTunnelsLock.Lock()
-		if tunnel, ok := p.activeTunnels[hostname]; ok {
-			newConns := make([]net.Conn, 0, len(tunnel.conns))
-			for _, c := range tunnel.conns {
-				if c != actualClientConn {
-					newConns = append(newConns, c)
-				}
-			}
-			if len(newConns) == 0 {
+		tunnel.count--
+		if tunnel.count == 0 {
+			tunnel.cancel()
+			if p.activeTunnels[hostname] == tunnel {
 				delete(p.activeTunnels, hostname)
-			} else {
-				tunnel.conns = newConns
 			}
 		}
 		p.activeTunnelsLock.Unlock()
 	}()
 
-	// Start bidirectional data transfer
-	p.pipe(hostname, actualClientConn, targetConn, clientReader)
+	// Start bidirectional data transfer with tunnel-level cancellation context.
+	p.pipe(tunnelCtx, hostname, actualClientConn, targetConn, clientReader)
 }
 
 // getRoute retrieves routing information for a hostname
@@ -907,29 +905,19 @@ type bufferedWriter struct {
 }
 
 // pipe handles bidirectional data transfer between connections
-func (p *SNIProxy) pipe(hostname string, clientConn, targetConn net.Conn, clientReader io.Reader) {
-	var wg sync.WaitGroup
-	wg.Add(2)
+func (p *SNIProxy) pipe(ctx context.Context, hostname string, clientConn, targetConn net.Conn, clientReader io.Reader) {
+	g, gCtx := errgroup.WithContext(ctx)
 
-	// closeOnce ensures we only close connections once
-	var closeOnce sync.Once
-	closeConns := func() {
-		closeOnce.Do(func() {
-			// Close both connections to unblock any pending reads
-			clientConn.Close()
-			targetConn.Close()
-		})
-	}
+	// Close connections when context cancels to unblock io.Copy operations
+	context.AfterFunc(gCtx, func() {
+		clientConn.Close()
+		targetConn.Close()
+	})
 
-	// Copy data from client to target (using the buffered reader)
-	go func() {
-		defer wg.Done()
-		defer closeConns()
-
-		// Get buffer from pool and return when done
+	// Copy data from client to target (using buffered reader and pooled memory).
+	g.Go(func() error {
 		bufPtr := p.bufferPool.Get().(*[]byte)
 		defer func() {
-			// Clear buffer before returning to pool to prevent data leakage
 			clear(*bufPtr)
 			p.bufferPool.Put(bufPtr)
 		}()
@@ -939,17 +927,13 @@ func (p *SNIProxy) pipe(hostname string, clientConn, targetConn net.Conn, client
 		if err != nil && err != io.EOF {
 			logger.Debug("Copy client->target error: %v", err)
 		}
-	}()
+		return err
+	})
 
 	// Copy data from target to client
-	go func() {
-		defer wg.Done()
-		defer closeConns()
-
-		// Get buffer from pool and return when done
+	g.Go(func() error {
 		bufPtr := p.bufferPool.Get().(*[]byte)
 		defer func() {
-			// Clear buffer before returning to pool to prevent data leakage
 			clear(*bufPtr)
 			p.bufferPool.Put(bufPtr)
 		}()
@@ -959,9 +943,10 @@ func (p *SNIProxy) pipe(hostname string, clientConn, targetConn net.Conn, client
 		if err != nil && err != io.EOF {
 			logger.Debug("Copy target->client error: %v", err)
 		}
-	}()
+		return err
+	})
 
-	wg.Wait()
+	_ = g.Wait()
 }
 
 // GetCacheStats returns cache statistics
@@ -997,16 +982,14 @@ func (p *SNIProxy) UpdateLocalSNIs(fullDomains []string) {
 
 	logger.Debug("Updated local SNIs, added %d, removed %d", len(newSNIs), len(removed))
 
-	// Terminate tunnels for removed SNIs
+	// Terminate tunnels for removed SNIs via context cancellation
 	if len(removed) > 0 {
 		p.activeTunnelsLock.Lock()
 		for _, sni := range removed {
-			if tunnels, ok := p.activeTunnels[sni]; ok {
-				for _, conn := range tunnels.conns {
-					conn.Close()
-				}
+			if tunnel, ok := p.activeTunnels[sni]; ok {
+				tunnel.cancel()
 				delete(p.activeTunnels, sni)
-				logger.Debug("Closed tunnels for SNI target change: %s", sni)
+				logger.Debug("Cancelled tunnel context for SNI target change: %s", sni)
 			}
 		}
 		p.activeTunnelsLock.Unlock()
