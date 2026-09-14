@@ -213,8 +213,19 @@ func (p *SNIProxy) parseProxyProtocolHeader(conn net.Conn) (*ProxyProtocolInfo, 
 	if len(parts) != 6 || parts[0] != "PROXY" {
 		// Check for PROXY UNKNOWN
 		if len(parts) == 2 && parts[0] == "PROXY" && parts[1] == "UNKNOWN" {
-			// PROXY UNKNOWN - use original connection info
-			return nil, conn, nil
+			// PROXY UNKNOWN - use original connection info, but keep any
+			// bytes that arrived after the header (the TLS ClientHello).
+			if err := conn.SetReadDeadline(time.Time{}); err != nil {
+				return nil, conn, fmt.Errorf("failed to clear read deadline: %w", err)
+			}
+			if len(remainingData) == 0 {
+				return nil, conn, nil
+			}
+			wrappedConn := &proxyProtocolConn{
+				Conn:   conn,
+				reader: io.MultiReader(bytes.NewReader(remainingData), conn),
+			}
+			return nil, wrappedConn, nil
 		}
 		// Invalid PROXY protocol, but might be regular TLS - treat as such
 		logger.Debug("Invalid PROXY protocol from trusted upstream %s, treating as regular TLS connection: %s", remoteHost, headerLine)
