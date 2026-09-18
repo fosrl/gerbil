@@ -997,20 +997,33 @@ func ensureMSSClamping() error {
 	// Calculate MSS value (MTU - 40 for IPv4 header (20) and TCP header (20))
 	mssValue := mtuInt - 40
 
-	// Rules to be managed - just the chains, we'll construct the full command separately
-	chains := []string{"INPUT", "OUTPUT", "FORWARD"}
+	// Rules to be managed. Each rule is scoped to the WireGuard interface so
+	// that only traffic entering or leaving the tunnel is clamped - traffic
+	// that never touches WireGuard (e.g. Traefik sharing this network
+	// namespace) must not be affected.
+	type mssRule struct {
+		chain string
+		flag  string // "-i" or "-o"
+	}
+	rules := []mssRule{
+		{"INPUT", "-i"},
+		{"OUTPUT", "-o"},
+		{"FORWARD", "-i"},
+		{"FORWARD", "-o"},
+	}
 
 	// First, try to delete any existing rules
-	for _, chain := range chains {
+	for _, rule := range rules {
 		deleteCmd := exec.Command("/usr/sbin/iptables",
 			"-t", "mangle",
-			"-D", chain,
+			"-D", rule.chain,
+			rule.flag, interfaceName,
 			"-p", "tcp",
 			"--tcp-flags", "SYN,RST", "SYN",
 			"-j", "TCPMSS",
 			"--set-mss", fmt.Sprintf("%d", mssValue))
 
-		logger.Info("Attempting to delete existing MSS clamping rule for chain %s", chain)
+		logger.Info("Attempting to delete existing MSS clamping rule for chain %s (%s %s)", rule.chain, rule.flag, interfaceName)
 
 		// Try deletion multiple times to handle multiple existing rules
 		for i := 0; i < 3; i++ {
@@ -1019,30 +1032,31 @@ func ensureMSSClamping() error {
 				// Convert exit status 1 to string for better logging
 				if exitErr, ok := err.(*exec.ExitError); ok {
 					logger.Debug("Deletion stopped for chain %s: %v (output: %s)",
-						chain, exitErr.String(), string(out))
+						rule.chain, exitErr.String(), string(out))
 				}
 				break // No more rules to delete
 			}
-			logger.Info("Deleted MSS clamping rule for chain %s (attempt %d)", chain, i+1)
+			logger.Info("Deleted MSS clamping rule for chain %s (attempt %d)", rule.chain, i+1)
 		}
 	}
 
 	// Then add the new rules
 	var errors []error
-	for _, chain := range chains {
+	for _, rule := range rules {
 		addCmd := exec.Command("/usr/sbin/iptables",
 			"-t", "mangle",
-			"-A", chain,
+			"-A", rule.chain,
+			rule.flag, interfaceName,
 			"-p", "tcp",
 			"--tcp-flags", "SYN,RST", "SYN",
 			"-j", "TCPMSS",
 			"--set-mss", fmt.Sprintf("%d", mssValue))
 
-		logger.Info("Adding MSS clamping rule for chain %s", chain)
+		logger.Info("Adding MSS clamping rule for chain %s (%s %s)", rule.chain, rule.flag, interfaceName)
 
 		if out, err := addCmd.CombinedOutput(); err != nil {
 			errMsg := fmt.Sprintf("Failed to add MSS clamping rule for chain %s: %v (output: %s)",
-				chain, err, string(out))
+				rule.chain, err, string(out))
 			logger.Error("%s", errMsg)
 			errors = append(errors, fmt.Errorf("%s", errMsg))
 			continue
@@ -1051,7 +1065,8 @@ func ensureMSSClamping() error {
 		// Verify the rule was added
 		checkCmd := exec.Command("/usr/sbin/iptables",
 			"-t", "mangle",
-			"-C", chain,
+			"-C", rule.chain,
+			rule.flag, interfaceName,
 			"-p", "tcp",
 			"--tcp-flags", "SYN,RST", "SYN",
 			"-j", "TCPMSS",
@@ -1059,13 +1074,13 @@ func ensureMSSClamping() error {
 
 		if out, err := checkCmd.CombinedOutput(); err != nil {
 			errMsg := fmt.Sprintf("Rule verification failed for chain %s: %v (output: %s)",
-				chain, err, string(out))
+				rule.chain, err, string(out))
 			logger.Error("%s", errMsg)
 			errors = append(errors, fmt.Errorf("%s", errMsg))
 			continue
 		}
 
-		logger.Info("Successfully added and verified MSS clamping rule for chain %s", chain)
+		logger.Info("Successfully added and verified MSS clamping rule for chain %s", rule.chain)
 	}
 
 	// If we encountered any errors, return them combined
