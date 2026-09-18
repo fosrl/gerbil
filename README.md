@@ -63,12 +63,13 @@ See [docs/observability.md](docs/observability.md) for complete documentation, m
 Important:
 - `reachableAt`: How should the remote server reach Gerbil's API?
 - `generateAndSaveKeyTo`: Where to save the generated WireGuard private key to persist across restarts.
-- `remoteConfig`: Remote config location to HTTP get the JSON based config from.
+- `remoteConfig`: Remote config location to HTTP get the JSON based config from. Mutually exclusive with `config`.
+- `config`: Path to a local JSON config file to load instead of fetching from `remoteConfig`. Mutually exclusive with `remoteConfig`. One of the two must be provided.
 
 Others:
 - `reportBandwidthTo` (optional): **DEPRECATED** - Use `remoteConfig` instead. Remote HTTP endpoint to send peer bandwidth data
 - `interface` (optional): Name of the WireGuard interface created by Gerbil. Default: `wg0`
-- `listen` (optional): Port to listen on for HTTP server. Default: `:3004`
+- `listen` (optional): **DEPRECATED** (overridden by `reachableAt`) - Address to listen on for the HTTP server. Default: `:3003`, unless `reachableAt` is set, in which case the port is derived from it.
 - `log-level` (optional): The log level to use (DEBUG, INFO, WARN, ERROR, FATAL). Default: `INFO`
 - `mtu` (optional): MTU of the WireGuard interface. Default: `1280`
 - `notify` (optional): URL to notify on peer changes
@@ -76,15 +77,22 @@ Others:
 - `local-proxy` (optional): Address for local proxy when routing local traffic. Default: `localhost`
 - `local-proxy-port` (optional): Port for local proxy when routing local traffic. Default: `443`
 - `local-overrides` (optional): Comma-separated list of domain names that should always be routed to the local proxy
-- `proxy-protocol` (optional): Enable PROXY protocol v1 for preserving client IP addresses when forwarding to downstream proxies. Default: `false`
+- `trusted-upstreams` (optional): Comma-separated list of trusted upstream proxy domain names/IPs allowed to send PROXY protocol headers to the SNI proxy
+- `proxy-protocol` (optional): Enable PROXY protocol v1 for preserving client IP addresses when forwarding to downstream proxies. Default: `true`
+- `do-traffic-shaping` (optional): Whether to set up per-peer bandwidth limiting via `tc` (requires the `tc` command and root privileges). Default: `false`
+- `bandwidth-limit` (optional): Bandwidth limit per peer when `do-traffic-shaping` is enabled (e.g. `50mbit`, `1gbit`). Default: `50mbit`
+- `disable-firewall` (optional): Disable the WireGuard firewall rules, allowing all inbound traffic on the interface. Default: `false`
+
+Metrics and OpenTelemetry flags (`--metrics-*`, `--otel-metrics-*`) are documented separately in [docs/observability.md](docs/observability.md).
 
 ## Environment Variables
 
 All CLI arguments can also be provided via environment variables:
 
 - `INTERFACE`: Name of the WireGuard interface
+- `CONFIG`: Path to a local JSON config file to load
 - `REMOTE_CONFIG`: URL of the remote config server
-- `LISTEN`: Address to listen on for HTTP server
+- `LISTEN`: Address to listen on for HTTP server (deprecated, overridden by `REACHABLE_AT`)
 - `GENERATE_AND_SAVE_KEY_TO`: Path to save generated private key
 - `REACHABLE_AT`: Endpoint of the HTTP server to tell remote config about
 - `LOG_LEVEL`: Log level (DEBUG, INFO, WARN, ERROR, FATAL)
@@ -94,7 +102,14 @@ All CLI arguments can also be provided via environment variables:
 - `LOCAL_PROXY`: Address for local proxy when routing local traffic
 - `LOCAL_PROXY_PORT`: Port for local proxy when routing local traffic
 - `LOCAL_OVERRIDES`: Comma-separated list of domain names that should always be routed to the local proxy
+- `TRUSTED_UPSTREAMS`: Comma-separated list of trusted upstream proxy domain names/IPs allowed to send PROXY protocol headers
 - `PROXY_PROTOCOL`: Enable PROXY protocol v1 for preserving client IP addresses (true/false)
+- `DO_TRAFFIC_SHAPING`: Enable per-peer bandwidth limiting via `tc` (true/false)
+- `BANDWIDTH_LIMIT`: Bandwidth limit per peer when traffic shaping is enabled (e.g. `50mbit`, `1gbit`)
+- `DISABLE_FIREWALL`: Disable the WireGuard firewall rules (true/false)
+- `GERBIL_MAX_UDP_CONNECTIONS`: Caps the number of concurrent per-peer outbound UDP sockets the relay keeps open, evicting the least-recently-used connection beyond this limit. No CLI flag equivalent. Default: `8192`
+
+Metrics and OpenTelemetry environment variables (`METRICS_*`, `OTEL_METRICS_*`, `DEPLOYMENT_ENVIRONMENT`) are documented separately in [docs/observability.md](docs/observability.md).
 
 Example:
 
