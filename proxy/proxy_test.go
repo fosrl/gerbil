@@ -1,8 +1,11 @@
 package proxy
 
 import (
+	"bytes"
+	"io"
 	"net"
 	"testing"
+	"time"
 )
 
 func TestBuildProxyProtocolHeader(t *testing.T) {
@@ -115,5 +118,70 @@ func TestBuildProxyProtocolHeaderFromInfo(t *testing.T) {
 	expected = "PROXY TCP6 2001:db8::1 ::1 12345 8080\r\n"
 	if header != expected {
 		t.Errorf("Expected header '%s', got '%s'", expected, header)
+	}
+}
+
+// TestParseProxyProtocolHeaderUnknownPreservesPayload checks that when a
+// trusted upstream sends "PROXY UNKNOWN\r\n" the bytes that follow the header
+// (the TLS ClientHello) are still readable from the returned connection.
+func TestParseProxyProtocolHeaderUnknownPreservesPayload(t *testing.T) {
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("Failed to listen: %v", err)
+	}
+	defer listener.Close()
+
+	proxy, err := NewSNIProxy(8443, "", "", "127.0.0.1", 443, nil, false, []string{"127.0.0.1"})
+	if err != nil {
+		t.Fatalf("Failed to create SNI proxy: %v", err)
+	}
+
+	payload := []byte("\x16\x03\x01client-hello-bytes")
+	accepted := make(chan net.Conn, 1)
+	go func() {
+		conn, err := listener.Accept()
+		if err != nil {
+			t.Errorf("Accept failed: %v", err)
+			accepted <- nil
+			return
+		}
+		accepted <- conn
+	}()
+
+	client, err := net.Dial("tcp", listener.Addr().String())
+	if err != nil {
+		t.Fatalf("Failed to dial: %v", err)
+	}
+	defer client.Close()
+
+	// Header and payload arrive in a single segment, as they do when the
+	// upstream writes both before the first flush.
+	if _, err := client.Write(append([]byte("PROXY UNKNOWN\r\n"), payload...)); err != nil {
+		t.Fatalf("Failed to write: %v", err)
+	}
+
+	serverConn := <-accepted
+	if serverConn == nil {
+		t.FailNow()
+	}
+	defer serverConn.Close()
+
+	proxyInfo, wrapped, err := proxy.parseProxyProtocolHeader(serverConn)
+	if err != nil {
+		t.Fatalf("parseProxyProtocolHeader returned error: %v", err)
+	}
+	if proxyInfo != nil {
+		t.Fatalf("Expected nil proxyInfo for PROXY UNKNOWN, got %+v", proxyInfo)
+	}
+
+	if err := wrapped.SetReadDeadline(time.Now().Add(2 * time.Second)); err != nil {
+		t.Fatalf("Failed to set read deadline: %v", err)
+	}
+	got := make([]byte, len(payload))
+	if _, err := io.ReadFull(wrapped, got); err != nil {
+		t.Fatalf("Payload after PROXY UNKNOWN header was lost: %v", err)
+	}
+	if !bytes.Equal(got, payload) {
+		t.Fatalf("Expected payload %q, got %q", payload, got)
 	}
 }
