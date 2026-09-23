@@ -18,6 +18,7 @@ import (
 	"os/exec"
 	"os/signal"
 	"path/filepath"
+	"regexp"
 	"runtime"
 	"runtime/pprof"
 	"strconv"
@@ -717,6 +718,7 @@ func main() {
 
 	// Set up HTTP server with metrics middleware
 	http.HandleFunc("/peer", httpMetricsMiddleware("peer", handlePeer))
+	http.HandleFunc("/update-peer-bandwidth", httpMetricsMiddleware("update_peer_bandwidth", handleUpdatePeerBandwidth))
 	http.HandleFunc("/update-proxy-mapping", httpMetricsMiddleware("update_proxy_mapping", handleUpdateProxyMapping))
 	http.HandleFunc("/update-destinations", httpMetricsMiddleware("update_destinations", handleUpdateDestinations))
 	http.HandleFunc("/update-local-snis", httpMetricsMiddleware("update_local_snis", handleUpdateLocalSNIs))
@@ -1323,7 +1325,7 @@ func addPeerInternal(peer Peer) error {
 	if doTrafficShaping {
 		logger.Debug("doTrafficShaping is true, setting up bandwidth limits for %d IPs", len(wgIPs))
 		for _, wgIP := range wgIPs {
-			if err := setupPeerBandwidthLimit(wgIP); err != nil {
+			if err := setupPeerBandwidthLimit(wgIP, bandwidthLimit); err != nil {
 				logger.Warn("Failed to setup bandwidth limit for peer IP %s: %v", wgIP, err)
 			}
 		}
@@ -1438,6 +1440,92 @@ func removePeerInternal(publicKey string) error {
 	metrics.RecordPeersTotal(interfaceName, -1)
 	metrics.RecordAllowedIPsCount(interfaceName, publicKey, -int64(allowedIPsCount))
 
+	return nil
+}
+
+// UpdatePeerBandwidthRequest is the payload for /update-peer-bandwidth, letting an external service
+// (e.g. the Pangolin control plane) change the traffic-shaping limit for a single peer at runtime.
+type UpdatePeerBandwidthRequest struct {
+	PublicKey      string `json:"publicKey"`
+	BandwidthLimit string `json:"bandwidthLimit"`
+}
+
+// tcRateRegex matches a tc HTB rate/ceil value, e.g. "50mbit", "1gbit", "500kbit".
+var tcRateRegex = regexp.MustCompile(`^[0-9]+(bit|kbit|mbit|gbit|kibit|mibit|gibit)$`)
+
+func handleUpdatePeerBandwidth(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	var req UpdatePeerBandwidthRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	if req.PublicKey == "" {
+		http.Error(w, "Missing publicKey", http.StatusBadRequest)
+		return
+	}
+	if !tcRateRegex.MatchString(req.BandwidthLimit) {
+		http.Error(w, "Invalid bandwidthLimit: expected a tc rate such as 50mbit or 1gbit", http.StatusBadRequest)
+		return
+	}
+
+	if err := updatePeerBandwidthLimit(req.PublicKey, req.BandwidthLimit); err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	w.WriteHeader(http.StatusOK)
+	json.NewEncoder(w).Encode(map[string]string{"status": "Peer bandwidth limit updated successfully"})
+}
+
+// updatePeerBandwidthLimit changes the traffic-shaping rate/ceil for an existing peer, identified by
+// public key, to limit. It looks up the peer's current AllowedIPs from WireGuard rather than trusting
+// the caller with IPs directly, since the caller only has authority over the peer's bandwidth policy.
+func updatePeerBandwidthLimit(publicKey string, limit string) error {
+	if !doTrafficShaping {
+		return fmt.Errorf("traffic shaping is not enabled on this gerbil instance")
+	}
+
+	pubKey, err := wgtypes.ParseKey(publicKey)
+	if err != nil {
+		return fmt.Errorf("failed to parse public key: %v", err)
+	}
+
+	wgMu.Lock()
+	defer wgMu.Unlock()
+
+	device, err := wgClient.Device(interfaceName)
+	if err != nil {
+		return fmt.Errorf("failed to get device: %v", err)
+	}
+
+	var wgIPs []string
+	found := false
+	for _, peer := range device.Peers {
+		if peer.PublicKey == pubKey {
+			found = true
+			for _, allowedIP := range peer.AllowedIPs {
+				wgIPs = append(wgIPs, allowedIP.IP.String())
+			}
+			break
+		}
+	}
+	if !found {
+		return fmt.Errorf("peer not found: %s", publicKey)
+	}
+
+	for _, wgIP := range wgIPs {
+		if err := setupPeerBandwidthLimit(wgIP, limit); err != nil {
+			return fmt.Errorf("failed to update bandwidth limit for peer IP %s: %v", wgIP, err)
+		}
+	}
+
+	logger.Info("Updated bandwidth limit for peer %s to %s", publicKey, limit)
 	return nil
 }
 
@@ -1916,10 +2004,49 @@ func ensureIFBDevice() error {
 	return nil
 }
 
+// tcDeleteFiltersByFlowID removes any tc filters on dev/parent whose flowid matches flowID. Used to
+// clear out a peer's previous filter before re-adding it, so that updating a peer's bandwidth limit
+// (which re-adds the filter each time) doesn't accumulate duplicate rules pointing at the same class.
+func tcDeleteFiltersByFlowID(dev, parent, flowID string) {
+	cmd := exec.Command("tc", "filter", "show", "dev", dev, "parent", parent)
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		logger.Debug("Failed to list filters on %s parent %s: %v, output: %s", dev, parent, err, string(output))
+		return
+	}
+
+	// Filter lines look like:
+	// filter parent 1: protocol ip pref 1 u32 chain 0 fh 800::800 order 2048 key ht 800 bkt 0 flowid 1:4
+	lines := strings.Split(string(output), "\n")
+	for _, line := range lines {
+		if !strings.Contains(line, "flowid "+flowID) || !strings.Contains(line, "fh ") {
+			continue
+		}
+		parts := strings.Fields(line)
+		var handle string
+		for j, part := range parts {
+			if part == "fh" && j+1 < len(parts) {
+				handle = parts[j+1]
+				break
+			}
+		}
+		if handle == "" {
+			continue
+		}
+		delCmd := exec.Command("tc", "filter", "del", "dev", dev, "parent", parent, "handle", handle, "prio", "1", "u32")
+		if delOutput, delErr := delCmd.CombinedOutput(); delErr != nil {
+			logger.Debug("Failed to delete filter handle %s on %s: %v, output: %s", handle, dev, delErr, string(delOutput))
+		} else {
+			logger.Debug("Deleted filter handle %s on %s", handle, dev)
+		}
+	}
+}
+
 // setupPeerBandwidthLimit sets up TC (Traffic Control) to limit bandwidth for a specific peer IP
-// Bandwidth limit is configurable via the --bandwidth-limit flag or BANDWIDTH_LIMIT env var (default: 50mbit)
-func setupPeerBandwidthLimit(peerIP string) error {
-	logger.Debug("setupPeerBandwidthLimit called for peer IP: %s", peerIP)
+// to the given limit (e.g. "50mbit", "1gbit"). Calling this again for an IP that already has a
+// class configured replaces the existing rate, which is how per-peer limits are updated at runtime.
+func setupPeerBandwidthLimit(peerIP string, limit string) error {
+	logger.Debug("setupPeerBandwidthLimit called for peer IP: %s with limit %s", peerIP, limit)
 
 	// Parse the IP to get just the IP address (strip any CIDR notation if present)
 	ip := peerIP
@@ -1958,27 +2085,18 @@ func setupPeerBandwidthLimit(peerIP string) error {
 	classID := fmt.Sprintf("1:%s", lastOctet)
 	logger.Debug("Generated class ID %s for peer IP %s", classID, ip)
 
-	// Create a class for this peer with bandwidth limit
-	cmd = exec.Command("tc", "class", "add", "dev", interfaceName, "parent", "1:", "classid", classID,
-		"htb", "rate", bandwidthLimit, "ceil", bandwidthLimit)
+	// Create a class for this peer with bandwidth limit. If the class already exists (either
+	// because the peer was set up before, or because we're updating an existing limit), replace it.
+	cmd = exec.Command("tc", "class", "replace", "dev", interfaceName, "parent", "1:", "classid", classID,
+		"htb", "rate", limit, "ceil", limit)
 	if output, err := cmd.CombinedOutput(); err != nil {
-		logger.Debug("tc class add failed for %s: %v, output: %s", ip, err, string(output))
-		// If class already exists, try to replace it
-		if strings.Contains(string(output), "File exists") {
-			cmd = exec.Command("tc", "class", "replace", "dev", interfaceName, "parent", "1:", "classid", classID,
-				"htb", "rate", bandwidthLimit, "ceil", bandwidthLimit)
-			if output, err := cmd.CombinedOutput(); err != nil {
-				return fmt.Errorf("failed to replace class: %v, output: %s", err, string(output))
-			}
-			logger.Debug("Successfully replaced existing class %s for peer IP %s", classID, ip)
-		} else {
-			return fmt.Errorf("failed to add class: %v, output: %s", err, string(output))
-		}
-	} else {
-		logger.Debug("Successfully added new class %s for peer IP %s", classID, ip)
+		return fmt.Errorf("failed to add/replace class: %v, output: %s", err, string(output))
 	}
+	logger.Debug("Successfully set class %s for peer IP %s to %s", classID, ip, limit)
 
-	// Add a filter to match traffic to this peer IP on wg0 egress (peer's download)
+	// Add a filter to match traffic to this peer IP on wg0 egress (peer's download). Clear any
+	// existing filter for this class first, in case this is an update rather than the first setup.
+	tcDeleteFiltersByFlowID(interfaceName, "1:", classID)
 	cmd = exec.Command("tc", "filter", "add", "dev", interfaceName, "protocol", "ip", "parent", "1:",
 		"prio", "1", "u32", "match", "ip", "dst", ip, "flowid", classID)
 	if output, err := cmd.CombinedOutput(); err != nil {
@@ -1993,35 +2111,26 @@ func setupPeerBandwidthLimit(peerIP string) error {
 	// Check if the ifb kernel module is loaded (works inside containers too)
 	if _, err := os.Stat("/sys/module/ifb"); os.IsNotExist(err) {
 		logger.Warn("IFB module not loaded, skipping IFB setup and ingress traffic shaping.")
-		logger.Info("Setup bandwidth limit of %s for peer IP %s (egress class %s, ingress class %s)", bandwidthLimit, ip, classID, ifbClassID)
+		logger.Info("Setup bandwidth limit of %s for peer IP %s (egress class %s, ingress class %s)", limit, ip, classID, ifbClassID)
 		return nil
 	}
 
-	cmd = exec.Command("tc", "class", "add", "dev", ifbName, "parent", "2:", "classid", ifbClassID,
-		"htb", "rate", bandwidthLimit, "ceil", bandwidthLimit)
+	cmd = exec.Command("tc", "class", "replace", "dev", ifbName, "parent", "2:", "classid", ifbClassID,
+		"htb", "rate", limit, "ceil", limit)
 	if output, err := cmd.CombinedOutput(); err != nil {
-		if strings.Contains(string(output), "File exists") {
-			cmd = exec.Command("tc", "class", "replace", "dev", ifbName, "parent", "2:", "classid", ifbClassID,
-				"htb", "rate", bandwidthLimit, "ceil", bandwidthLimit)
-			if output, err := cmd.CombinedOutput(); err != nil {
-				logger.Warn("Failed to replace IFB class for peer IP %s: %v, output: %s", ip, err, string(output))
-			} else {
-				logger.Debug("Replaced existing IFB class %s for peer IP %s", ifbClassID, ip)
-			}
-		} else {
-			logger.Warn("Failed to add IFB class for peer IP %s: %v, output: %s", ip, err, string(output))
-		}
+		logger.Warn("Failed to add/replace IFB class for peer IP %s: %v, output: %s", ip, err, string(output))
 	} else {
-		logger.Debug("Added IFB class %s for peer IP %s", ifbClassID, ip)
+		logger.Debug("Set IFB class %s for peer IP %s to %s", ifbClassID, ip, limit)
 	}
 
+	tcDeleteFiltersByFlowID(ifbName, "2:", ifbClassID)
 	cmd = exec.Command("tc", "filter", "add", "dev", ifbName, "protocol", "ip", "parent", "2:",
 		"prio", "1", "u32", "match", "ip", "src", ip, "flowid", ifbClassID)
 	if output, err := cmd.CombinedOutput(); err != nil {
 		logger.Warn("Failed to add IFB ingress filter for peer IP %s: %v, output: %s", ip, err, string(output))
 	}
 
-	logger.Info("Setup bandwidth limit of %s for peer IP %s (egress class %s, ingress class %s)", bandwidthLimit, ip, classID, ifbClassID)
+	logger.Info("Setup bandwidth limit of %s for peer IP %s (egress class %s, ingress class %s)", limit, ip, classID, ifbClassID)
 	return nil
 }
 
