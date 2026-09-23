@@ -64,6 +64,9 @@ type WgConfig struct {
 type Peer struct {
 	PublicKey  string   `json:"publicKey"`
 	AllowedIPs []string `json:"allowedIps"`
+	// BandwidthLimit optionally overrides the global --bandwidth-limit for this peer (e.g. "50mbit",
+	// "1gbit"). Only used when traffic shaping is enabled; empty means use the global default.
+	BandwidthLimit string `json:"bandwidthLimit,omitempty"`
 }
 
 type PeerBandwidth struct {
@@ -1259,6 +1262,12 @@ func handleAddPeer(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if peer.BandwidthLimit != "" && !tcRateRegex.MatchString(peer.BandwidthLimit) {
+		http.Error(w, "Invalid bandwidthLimit: expected a tc rate such as 50mbit or 1gbit", http.StatusBadRequest)
+		metrics.RecordPeerOperation("add", "error")
+		return
+	}
+
 	err := addPeer(peer)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
@@ -1321,11 +1330,16 @@ func addPeerInternal(peer Peer) error {
 		return fmt.Errorf("failed to add peer: %v", err)
 	}
 
-	// Setup bandwidth limiting for each peer IP
+	// Setup bandwidth limiting for each peer IP, using the peer-specific limit if one was
+	// supplied and falling back to the global default otherwise.
 	if doTrafficShaping {
-		logger.Debug("doTrafficShaping is true, setting up bandwidth limits for %d IPs", len(wgIPs))
+		limit := bandwidthLimit
+		if peer.BandwidthLimit != "" {
+			limit = peer.BandwidthLimit
+		}
+		logger.Debug("doTrafficShaping is true, setting up bandwidth limits (%s) for %d IPs", limit, len(wgIPs))
 		for _, wgIP := range wgIPs {
-			if err := setupPeerBandwidthLimit(wgIP, bandwidthLimit); err != nil {
+			if err := setupPeerBandwidthLimit(wgIP, limit); err != nil {
 				logger.Warn("Failed to setup bandwidth limit for peer IP %s: %v", wgIP, err)
 			}
 		}
