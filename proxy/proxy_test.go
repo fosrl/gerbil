@@ -185,3 +185,31 @@ func TestParseProxyProtocolHeaderUnknownPreservesPayload(t *testing.T) {
 		t.Fatalf("Expected payload %q, got %q", payload, got)
 	}
 }
+
+// TestBuildProxyProtocolHeaderFromInfoIPv4MappedSource checks that an IPv4
+// client that a dual-stack upstream (e.g. HAProxy bound to "::") reports as
+// "PROXY TCP6 ::ffff:a.b.c.d ..." is forwarded with a valid TCP4 line.
+// PROXY v1 requires TCP4 addresses in dotted-quad form, and parsers such as
+// go-proxyproto (used by Traefik) reject "TCP4 ::ffff:a.b.c.d".
+func TestBuildProxyProtocolHeaderFromInfoIPv4MappedSource(t *testing.T) {
+	proxy, err := NewSNIProxy(8443, "", "", "127.0.0.1", 443, nil, true, nil)
+	if err != nil {
+		t.Fatalf("Failed to create SNI proxy: %v", err)
+	}
+
+	proxyInfo := &ProxyProtocolInfo{
+		Protocol: "TCP6",
+		SrcIP:    "::ffff:203.0.113.7",
+		DestIP:   "::ffff:10.0.0.1",
+		SrcPort:  51000,
+		DestPort: 443,
+	}
+
+	targetAddr, _ := net.ResolveTCPAddr("tcp", "127.0.0.1:8080")
+	header := proxy.buildProxyProtocolHeaderFromInfo(proxyInfo, targetAddr)
+
+	expected := "PROXY TCP4 203.0.113.7 127.0.0.1 51000 8080\r\n"
+	if header != expected {
+		t.Errorf("Expected header %q, got %q", expected, header)
+	}
+}
