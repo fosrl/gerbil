@@ -670,7 +670,7 @@ const addrCacheTTL = 5 * time.Minute
 // getCachedAddr returns a cached UDP address or resolves and caches it.
 // This avoids per-packet DNS lookups which are a major throughput bottleneck.
 func (s *UDPProxyServer) getCachedAddr(ip string, port int) (*net.UDPAddr, error) {
-	key := fmt.Sprintf("%s:%d", ip, port)
+	key := net.JoinHostPort(ip, strconv.Itoa(port))
 
 	// Check cache first
 	if cached, ok := s.addrCache.Load(key); ok {
@@ -1132,7 +1132,7 @@ func (s *UDPProxyServer) notifyServer(endpoint ClientEndpoint) {
 	logger.Debug("Received proxy mapping from server: %v", mapping)
 
 	// Store the mapping with current timestamp
-	key := fmt.Sprintf("%s:%d", endpoint.IP, endpoint.Port)
+	key := net.JoinHostPort(endpoint.IP, strconv.Itoa(endpoint.Port))
 	logger.Debug("About to store proxy mapping with key: %s (from endpoint IP=%s, Port=%d)", key, endpoint.IP, endpoint.Port)
 	mapping.LastUsed = time.Now()
 	if _, existed := s.proxyMappings.Load(key); existed {
@@ -1147,7 +1147,7 @@ func (s *UDPProxyServer) notifyServer(endpoint ClientEndpoint) {
 
 // Updated to support multiple destinations
 func (s *UDPProxyServer) UpdateProxyMapping(sourceIP string, sourcePort int, destinations []PeerDestination) {
-	key := fmt.Sprintf("%s:%d", sourceIP, sourcePort)
+	key := net.JoinHostPort(sourceIP, strconv.Itoa(sourcePort))
 	mapping := ProxyMapping{
 		Destinations: destinations,
 		LastUsed:     time.Now(),
