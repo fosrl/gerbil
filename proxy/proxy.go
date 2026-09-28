@@ -314,10 +314,14 @@ func (p *SNIProxy) buildProxyProtocolHeaderFromInfo(proxyInfo *ProxyProtocolInfo
 	if srcIP == nil {
 		return "PROXY UNKNOWN\r\n"
 	}
+	srcIPStr := proxyInfo.SrcIP
 
-	if srcIP.To4() != nil {
-		// Source is IPv4, use TCP4 protocol
+	if srcIP4 := srcIP.To4(); srcIP4 != nil {
+		// Source is IPv4, use TCP4 protocol. Write it in dotted form: an
+		// IPv4-mapped IPv6 source ("::ffff:a.b.c.d", as sent in a TCP6 line
+		// by a dual-stack upstream) is not a valid TCP4 address.
 		protocol = "TCP4"
+		srcIPStr = srcIP4.String()
 		if targetTCP.IP.To4() != nil {
 			// Target is also IPv4, use as-is
 			targetIP = targetTCP.IP.String()
@@ -343,7 +347,7 @@ func (p *SNIProxy) buildProxyProtocolHeaderFromInfo(proxyInfo *ProxyProtocolInfo
 
 	return fmt.Sprintf("PROXY %s %s %s %d %d\r\n",
 		protocol,
-		proxyInfo.SrcIP,
+		srcIPStr,
 		targetIP,
 		proxyInfo.SrcPort,
 		targetTCP.Port)
