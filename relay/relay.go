@@ -26,6 +26,12 @@ import (
 
 const relayIfname = "relay"
 
+// natKeepalivePacket is sent by newt/olm between hole punches only to keep
+// their NAT mapping to this relay port alive. It must match the packet in
+// newt's holepunch package. It is shaped like an encrypted hole punch with an
+// unparseable key so older gerbils drop it silently too.
+var natKeepalivePacket = []byte(`{"ephemeralPublicKey":"keepalive"}`)
+
 type EncryptedHolePunchMessage struct {
 	EphemeralPublicKey string `json:"ephemeralPublicKey"`
 	Nonce              []byte `json:"nonce"`
@@ -404,6 +410,11 @@ func (s *UDPProxyServer) packetWorker() {
 			metrics.RecordUDPPacketSize(relayIfname, "wireguard", float64(packet.n))
 			// Process as a WireGuard packet.
 			s.handleWireGuardPacket(packet.data, packet.remoteAddr)
+		} else if bytes.Equal(packet.data, natKeepalivePacket) {
+			// Nothing to do: the packet reaching us is what keeps the NAT
+			// mapping alive, and it must not count against the hole punch
+			// rate limit.
+			metrics.RecordUDPPacket(relayIfname, "nat_keepalive", "in")
 		} else {
 			metrics.RecordUDPPacket(relayIfname, "hole_punch", "in")
 			metrics.RecordUDPPacketSize(relayIfname, "hole_punch", float64(packet.n))
