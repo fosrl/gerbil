@@ -230,19 +230,52 @@ type UDPProxyServer struct {
 	// notifyChan is the async queue for hole-punch endpoint notifications.
 	// Dedicated notifier workers drain this channel and perform the HTTP call.
 	notifyChan chan ClientEndpoint
+	// notifyClient is shared by the notifier workers. Its transport keeps one
+	// idle connection per worker so requests reuse connections instead of
+	// paying a new TCP/TLS handshake each time (the default transport only
+	// keeps 2 per host, which is very costly when the server is far away).
+	notifyClient *http.Client
+	// lastNotifyDropWarn (unix nanos) throttles the queue-full warning
+	lastNotifyDropWarn atomic.Int64
 	// ReachableAt is the URL where this server can be reached
 	ReachableAt string
 }
+
+const (
+	// endpointNotifierWorkers is the number of concurrent HTTP notifications to
+	// the server. Throughput is roughly workers / round trip time, so this has
+	// to be high enough for exit nodes that are far from the server.
+	endpointNotifierWorkers = 64
+	// endpointNotifyQueueSize is how many notifications can wait for a worker
+	// before new ones are dropped.
+	endpointNotifyQueueSize = 10000
+	// endpointNotifyTimeout bounds each notification so a hung request cannot
+	// hold a worker forever.
+	endpointNotifyTimeout = 10 * time.Second
+	// notifyDropWarnInterval is the minimum time between queue-full warnings.
+	notifyDropWarnInterval = 10 * time.Second
+)
 
 // NewUDPProxyServer initializes the server with a buffered packet channel and derived context.
 func NewUDPProxyServer(parentCtx context.Context, addr, serverURL string, privateKey wgtypes.Key, reachableAt string) *UDPProxyServer {
 	ctx, cancel := context.WithCancel(parentCtx)
 	return &UDPProxyServer{
-		addr:        addr,
-		serverURL:   serverURL,
-		privateKey:  privateKey,
-		packetChan:  make(chan Packet, 50000), // Increased from 1000 to handle high throughput
-		notifyChan:  make(chan ClientEndpoint, 1000),
+		addr:       addr,
+		serverURL:  serverURL,
+		privateKey: privateKey,
+		packetChan: make(chan Packet, 50000), // Increased from 1000 to handle high throughput
+		notifyChan: make(chan ClientEndpoint, endpointNotifyQueueSize),
+		notifyClient: &http.Client{
+			Timeout: endpointNotifyTimeout,
+			Transport: &http.Transport{
+				Proxy:               http.ProxyFromEnvironment,
+				MaxIdleConns:        endpointNotifierWorkers,
+				MaxIdleConnsPerHost: endpointNotifierWorkers,
+				IdleConnTimeout:     90 * time.Second,
+				TLSHandshakeTimeout: endpointNotifyTimeout,
+				ForceAttemptHTTP2:   true,
+			},
+		},
 		ReachableAt: reachableAt,
 		ctx:         ctx,
 		cancel:      cancel,
@@ -302,7 +335,7 @@ func (s *UDPProxyServer) Start() error {
 	go s.cleanupHolePunchRateLimiter()
 
 	// Start async endpoint notifier workers (HTTP calls off the hot path)
-	for i := 0; i < 5; i++ {
+	for i := 0; i < endpointNotifierWorkers; i++ {
 		go s.endpointNotifierWorker()
 	}
 
@@ -480,8 +513,15 @@ func (s *UDPProxyServer) packetWorker() {
 			case <-s.ctx.Done():
 				// shutting down
 			default:
-				logger.Debug("Notification queue full, dropping hole punch notification for %s:%d", endpoint.IP, endpoint.Port)
+				// Forget the cached state so the client's next hole punch is
+				// sent instead of being deduplicated against this dropped one.
+				s.lastEndpointCache.Delete(cacheKey)
 				metrics.RecordHolePunchEvent(relayIfname, "queue_full")
+				now := time.Now().UnixNano()
+				last := s.lastNotifyDropWarn.Load()
+				if now-last >= int64(notifyDropWarnInterval) && s.lastNotifyDropWarn.CompareAndSwap(last, now) {
+					logger.Warn("Notification queue full (%d queued), dropping hole punch notifications; the server may be slow or unreachable", len(s.notifyChan))
+				}
 			}
 			s.clearSessionsForIP(endpoint.IP) // Clear sessions for this IP to allow re-establishment
 			metrics.RecordHolePunchEvent(relayIfname, "success")
@@ -1108,7 +1148,14 @@ func (s *UDPProxyServer) notifyServer(endpoint ClientEndpoint) {
 		return
 	}
 
-	resp, err := http.Post(s.serverURL+"/gerbil/update-hole-punch", "application/json", bytes.NewBuffer(jsonData))
+	req, err := http.NewRequestWithContext(s.ctx, http.MethodPost, s.serverURL+"/gerbil/update-hole-punch", bytes.NewBuffer(jsonData))
+	if err != nil {
+		logger.Error("Failed to create notify request: %v", err)
+		return
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := s.notifyClient.Do(req)
 	if err != nil {
 		logger.Error("Failed to notify server: %v", err)
 		return
