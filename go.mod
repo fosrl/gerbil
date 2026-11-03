@@ -1,6 +1,6 @@
 module github.com/fosrl/gerbil
 
-go 1.26.0
+go 1.26.9
 
 require (
 	github.com/patrickmn/go-cache v2.1.0+incompatible
