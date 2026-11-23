@@ -5,6 +5,8 @@ import (
 	"net/netip"
 	"os"
 	"os/exec"
+	"regexp"
+	"strconv"
 	"strings"
 	"sync"
 
@@ -34,6 +36,112 @@ const (
 	// maxFilterPref is the pref given to the broadest possible prefix (/0).
 	maxFilterPref = 33
 )
+
+// shapingLimit is the HTB rate and optional burst applied to a peer. rate is used as both rate and
+// ceil. burst is used as both burst and cburst; empty leaves tc to pick its default, which is
+// about one packet, so the peer can never exceed rate even briefly.
+type shapingLimit struct {
+	rate  string
+	burst string
+}
+
+func (l shapingLimit) String() string {
+	if l.burst == "" {
+		return l.rate
+	}
+	return l.rate + " burst " + l.burst
+}
+
+// htbArgs returns the tc arguments for an HTB class with this limit.
+func (l shapingLimit) htbArgs() []string {
+	args := []string{"htb", "rate", l.rate, "ceil", l.rate}
+	if l.burst != "" {
+		args = append(args, "burst", l.burst, "cburst", l.burst)
+	}
+	return args
+}
+
+// tcRateRegex matches a tc HTB rate/ceil value, e.g. "50mbit", "1gbit", "500kbit".
+var tcRateRegex = regexp.MustCompile(`^([0-9]+)(bit|kbit|mbit|gbit|kibit|mibit|gibit)$`)
+
+// tcSizeRegex matches a tc size in bytes, e.g. "4mb", "512kb", "1600". Units follow tc: k/kb is
+// 1024 bytes and m/mb is 1024*1024 bytes.
+var tcSizeRegex = regexp.MustCompile(`^([0-9]+)(b|k|kb|m|mb)?$`)
+
+const (
+	// minBurstBytes keeps a burst from being smaller than one full-size packet.
+	minBurstBytes = 1600
+	// maxBurstSeconds is how long a burst may take to drain at the class rate. HTB stores the
+	// burst as a time in a 32-bit count of 64ns ticks (about 274.9s) and tc refuses anything
+	// longer with "burst out of range", which would leave the peer without a class.
+	maxBurstSeconds = 270
+)
+
+func parseTCRate(s string) (float64, error) {
+	m := tcRateRegex.FindStringSubmatch(s)
+	if m == nil {
+		return 0, fmt.Errorf("invalid rate %q: expected a tc rate such as 8mbit or 1gbit", s)
+	}
+	n, err := strconv.ParseFloat(m[1], 64)
+	if err != nil {
+		return 0, fmt.Errorf("invalid rate %q: %v", s, err)
+	}
+	mult := map[string]float64{
+		"bit": 1, "kbit": 1e3, "mbit": 1e6, "gbit": 1e9,
+		"kibit": 1 << 10, "mibit": 1 << 20, "gibit": 1 << 30,
+	}[m[2]]
+	if n == 0 {
+		return 0, fmt.Errorf("invalid rate %q: must be greater than zero", s)
+	}
+	return n * mult, nil
+}
+
+func parseTCSize(s string) (float64, error) {
+	m := tcSizeRegex.FindStringSubmatch(s)
+	if m == nil {
+		return 0, fmt.Errorf("invalid burst %q: expected a size in bytes such as 4mb, 512kb or 1600", s)
+	}
+	n, err := strconv.ParseFloat(m[1], 64)
+	if err != nil {
+		return 0, fmt.Errorf("invalid burst %q: %v", s, err)
+	}
+	mult := map[string]float64{"": 1, "b": 1, "k": 1 << 10, "kb": 1 << 10, "m": 1 << 20, "mb": 1 << 20}[m[2]]
+	return n * mult, nil
+}
+
+// newShapingLimit validates rate and burst together. An empty burst is allowed and means "use tc's
+// default".
+func newShapingLimit(rate, burst string) (shapingLimit, error) {
+	bitsPerSec, err := parseTCRate(rate)
+	if err != nil {
+		return shapingLimit{}, err
+	}
+	if burst != "" {
+		bytes, err := parseTCSize(burst)
+		if err != nil {
+			return shapingLimit{}, err
+		}
+		if bytes < minBurstBytes {
+			return shapingLimit{}, fmt.Errorf("invalid burst %q: must be at least %d bytes", burst, minBurstBytes)
+		}
+		if secs := bytes * 8 / bitsPerSec; secs > maxBurstSeconds {
+			return shapingLimit{}, fmt.Errorf("burst %s is too large for rate %s: it would take %.0fs to drain and tc allows at most %ds",
+				burst, rate, secs, maxBurstSeconds)
+		}
+	}
+	return shapingLimit{rate: rate, burst: burst}, nil
+}
+
+// resolvePeerShapingLimit applies the global defaults to a peer's optional overrides.
+func resolvePeerShapingLimit(rate, burst string) (shapingLimit, error) {
+	if rate == "" {
+		rate = bandwidthLimit
+	}
+	if burst == "" {
+		burst = bandwidthBurst
+	}
+	return newShapingLimit(rate, burst)
+}
 
 // ifbReady is set once the IFB device and its HTB qdisc are in place. When false, only egress
 // shaping is applied.
@@ -316,9 +424,9 @@ func ensureIFBDevice() error {
 }
 
 // setupPeerBandwidthLimit limits traffic to and from allowedIP (a CIDR or bare IPv4 address) to
-// limit (e.g. "50mbit", "1gbit"). Calling it again for a prefix that is already shaped only
-// replaces the rate, which is how per-peer limits are updated at runtime.
-func setupPeerBandwidthLimit(allowedIP string, limit string) error {
+// limit. Calling it again for a prefix that is already shaped only replaces the rate and burst,
+// which is how per-peer limits are updated at runtime.
+func setupPeerBandwidthLimit(allowedIP string, limit shapingLimit) error {
 	p, err := normalizeShapingPrefix(allowedIP)
 	if err != nil {
 		return err
@@ -336,8 +444,8 @@ func setupPeerBandwidthLimit(allowedIP string, limit string) error {
 
 	egressClass := tcClassID(egressQdiscMajor, entry.minor)
 	egressParent := fmt.Sprintf("%x:", egressQdiscMajor)
-	if out, err := runTC("class", "replace", "dev", interfaceName, "parent", egressParent,
-		"classid", egressClass, "htb", "rate", limit, "ceil", limit); err != nil {
+	if out, err := runTC(append([]string{"class", "replace", "dev", interfaceName, "parent", egressParent,
+		"classid", egressClass}, limit.htbArgs()...)...); err != nil {
 		if isNew {
 			shaper.release(p)
 		}
@@ -358,8 +466,8 @@ func setupPeerBandwidthLimit(allowedIP string, limit string) error {
 	ingressClass := tcClassID(ingressQdiscMajor, entry.minor)
 	if ifbReady {
 		ingressParent := fmt.Sprintf("%x:", ingressQdiscMajor)
-		if out, err := runTC("class", "replace", "dev", ifbName, "parent", ingressParent,
-			"classid", ingressClass, "htb", "rate", limit, "ceil", limit); err != nil {
+		if out, err := runTC(append([]string{"class", "replace", "dev", ifbName, "parent", ingressParent,
+			"classid", ingressClass}, limit.htbArgs()...)...); err != nil {
 			logger.Warn("Failed to add/replace IFB class %s for %s: %v, output: %s", ingressClass, p, err, out)
 		} else if !entry.ingressFilter {
 			tcDeleteFilters(ifbName, ingressParent, ingressClass)

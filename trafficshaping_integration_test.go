@@ -53,9 +53,12 @@ func TestTrafficShapingKernel(t *testing.T) {
 		t.Fatalf("stale filters survived startup:\n%s", out)
 	}
 
+	limit8, _ := newShapingLimit("8mbit", "")
+	limit16, _ := newShapingLimit("16mbit", "")
+
 	peers := []string{"100.89.0.2/32", "100.89.0.28/32", "100.89.1.28/32", "100.89.2.28/32", "100.89.0.20/32", "100.89.1.0/24"}
 	for _, p := range peers {
-		if err := setupPeerBandwidthLimit(p, "8mbit"); err != nil {
+		if err := setupPeerBandwidthLimit(p, limit8); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -75,14 +78,14 @@ func TestTrafficShapingKernel(t *testing.T) {
 			if err := removePeerBandwidthLimit(p); err != nil {
 				t.Fatal(err)
 			}
-			if err := setupPeerBandwidthLimit(p, "8mbit"); err != nil {
+			if err := setupPeerBandwidthLimit(p, limit8); err != nil {
 				t.Fatal(err)
 			}
-			if err := setupPeerBandwidthLimit(p, "16mbit"); err != nil {
+			if err := setupPeerBandwidthLimit(p, limit16); err != nil {
 				t.Fatal(err)
 			}
 		}
-		if err := setupPeerBandwidthLimit("100.89.1.0/24", "8mbit"); err != nil {
+		if err := setupPeerBandwidthLimit("100.89.1.0/24", limit8); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -112,6 +115,26 @@ func TestTrafficShapingKernel(t *testing.T) {
 	}
 	if out := run("tc", "class", "show", "dev", "ifb_wg0", "classid", "2:14"); !strings.Contains(out, "rate 16Mbit") {
 		t.Fatalf("100.89.0.20 update not applied:\n%s", out)
+	}
+
+	// Burst is applied to both directions, and clearing it goes back to tc's default.
+	burst, err := newShapingLimit("4mbit", "4mb")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := setupPeerBandwidthLimit("100.89.2.28/32", burst); err != nil {
+		t.Fatal(err)
+	}
+	for _, c := range []struct{ dev, class string }{{"wg0", "1:21c"}, {"ifb_wg0", "2:21c"}} {
+		if out := run("tc", "class", "show", "dev", c.dev, "classid", c.class); !strings.Contains(out, "rate 4Mbit ceil 4Mbit burst 4Mb cburst 4Mb") {
+			t.Fatalf("burst not applied on %s:\n%s", c.dev, out)
+		}
+	}
+	if err := setupPeerBandwidthLimit("100.89.2.28/32", limit8); err != nil {
+		t.Fatal(err)
+	}
+	if out := run("tc", "class", "show", "dev", "ifb_wg0", "classid", "2:21c"); strings.Contains(out, "burst 4Mb") {
+		t.Fatalf("burst not cleared:\n%s", out)
 	}
 
 	// /32 filters must be evaluated before the /24.

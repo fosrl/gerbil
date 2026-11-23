@@ -18,7 +18,6 @@ import (
 	"os/exec"
 	"os/signal"
 	"path/filepath"
-	"regexp"
 	"runtime"
 	"runtime/pprof"
 	"strconv"
@@ -49,6 +48,7 @@ var (
 	proxySNI         *proxy.SNIProxy
 	doTrafficShaping bool
 	bandwidthLimit   string
+	bandwidthBurst   string
 	ifbName          string // IFB device name for ingress traffic shaping
 	disableFirewall  bool
 )
@@ -67,6 +67,9 @@ type Peer struct {
 	// BandwidthLimit optionally overrides the global --bandwidth-limit for this peer (e.g. "50mbit",
 	// "1gbit"). Only used when traffic shaping is enabled; empty means use the global default.
 	BandwidthLimit string `json:"bandwidthLimit,omitempty"`
+	// BandwidthBurst optionally overrides the global --bandwidth-burst for this peer (e.g. "4mb").
+	// Empty means use the global default.
+	BandwidthBurst string `json:"bandwidthBurst,omitempty"`
 }
 
 type PeerBandwidth struct {
@@ -350,6 +353,7 @@ func main() {
 	proxyProtocolStr := os.Getenv("PROXY_PROTOCOL")
 	doTrafficShapingStr := os.Getenv("DO_TRAFFIC_SHAPING")
 	bandwidthLimitStr := os.Getenv("BANDWIDTH_LIMIT")
+	bandwidthBurstStr := os.Getenv("BANDWIDTH_BURST")
 	disableFirewallStr := os.Getenv("DISABLE_FIREWALL")
 
 	// Read metrics env vars (defaults applied by DefaultMetricsConfig; these override defaults).
@@ -483,6 +487,13 @@ func main() {
 	}
 	if bandwidthLimitStr == "" {
 		flag.StringVar(&bandwidthLimit, "bandwidth-limit", "50mbit", "Bandwidth limit per peer for traffic shaping (e.g. 50mbit, 1gbit)")
+	}
+
+	if bandwidthBurstStr != "" {
+		bandwidthBurst = bandwidthBurstStr
+	}
+	if bandwidthBurstStr == "" {
+		flag.StringVar(&bandwidthBurst, "bandwidth-burst", "", "Bytes each peer may send above --bandwidth-limit before being held to it (e.g. 4mb, 512kb). Empty uses tc's default of about one packet")
 	}
 
 	// Metrics CLI flags – always registered so that CLI overrides env/defaults.
@@ -661,6 +672,11 @@ func main() {
 
 	// Set up the egress qdisc and IFB device for bidirectional traffic shaping if enabled
 	if doTrafficShaping {
+		limit, err := newShapingLimit(bandwidthLimit, bandwidthBurst)
+		if err != nil {
+			logger.Fatal("Invalid traffic shaping defaults: %v", err)
+		}
+		logger.Info("Default per-peer bandwidth limit: %s", limit)
 		if err := initTrafficShaping(); err != nil {
 			logger.Fatal("Failed to initialize traffic shaping: %v", err)
 		}
@@ -1262,10 +1278,12 @@ func handleAddPeer(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if peer.BandwidthLimit != "" && !tcRateRegex.MatchString(peer.BandwidthLimit) {
-		http.Error(w, "Invalid bandwidthLimit: expected a tc rate such as 50mbit or 1gbit", http.StatusBadRequest)
-		metrics.RecordPeerOperation("add", "error")
-		return
+	if peer.BandwidthLimit != "" || peer.BandwidthBurst != "" {
+		if _, err := resolvePeerShapingLimit(peer.BandwidthLimit, peer.BandwidthBurst); err != nil {
+			http.Error(w, "Invalid bandwidth settings: "+err.Error(), http.StatusBadRequest)
+			metrics.RecordPeerOperation("add", "error")
+			return
+		}
 	}
 
 	err := addPeer(peer)
@@ -1335,9 +1353,22 @@ func addPeerInternal(peer Peer) error {
 	// Setup bandwidth limiting for each peer IP, using the peer-specific limit if one was
 	// supplied and falling back to the global default otherwise.
 	if doTrafficShaping {
-		limit := bandwidthLimit
-		if peer.BandwidthLimit != "" {
-			limit = peer.BandwidthLimit
+		limit, err := resolvePeerShapingLimit(peer.BandwidthLimit, peer.BandwidthBurst)
+		if err != nil {
+			// Peers from the remote config skip the HTTP validation. Never leave the peer
+			// unshaped: keep its own rate without a burst if that is valid, otherwise fall
+			// back to the global defaults (validated at startup).
+			rate := peer.BandwidthLimit
+			if rate == "" {
+				rate = bandwidthLimit
+			}
+			if noBurst, rateErr := newShapingLimit(rate, ""); rateErr == nil {
+				logger.Warn("Invalid bandwidth settings for peer %s (%v), using %s with no burst", peer.PublicKey, err, noBurst)
+				limit = noBurst
+			} else {
+				logger.Warn("Invalid bandwidth settings for peer %s (%v), using defaults", peer.PublicKey, err)
+				limit, _ = newShapingLimit(bandwidthLimit, bandwidthBurst)
+			}
 		}
 		logger.Debug("doTrafficShaping is true, setting up bandwidth limits (%s) for %d prefixes", limit, len(shapedPrefixes))
 		for _, prefix := range shapedPrefixes {
@@ -1466,10 +1497,9 @@ func removePeerInternal(publicKey string) error {
 type UpdatePeerBandwidthRequest struct {
 	PublicKey      string `json:"publicKey"`
 	BandwidthLimit string `json:"bandwidthLimit"`
+	// BandwidthBurst is optional; empty means use the global --bandwidth-burst.
+	BandwidthBurst string `json:"bandwidthBurst,omitempty"`
 }
-
-// tcRateRegex matches a tc HTB rate/ceil value, e.g. "50mbit", "1gbit", "500kbit".
-var tcRateRegex = regexp.MustCompile(`^[0-9]+(bit|kbit|mbit|gbit|kibit|mibit|gibit)$`)
 
 func handleUpdatePeerBandwidth(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
@@ -1487,12 +1517,17 @@ func handleUpdatePeerBandwidth(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "Missing publicKey", http.StatusBadRequest)
 		return
 	}
-	if !tcRateRegex.MatchString(req.BandwidthLimit) {
-		http.Error(w, "Invalid bandwidthLimit: expected a tc rate such as 50mbit or 1gbit", http.StatusBadRequest)
+	if req.BandwidthLimit == "" {
+		http.Error(w, "Missing bandwidthLimit", http.StatusBadRequest)
+		return
+	}
+	limit, err := resolvePeerShapingLimit(req.BandwidthLimit, req.BandwidthBurst)
+	if err != nil {
+		http.Error(w, "Invalid bandwidth settings: "+err.Error(), http.StatusBadRequest)
 		return
 	}
 
-	if err := updatePeerBandwidthLimit(req.PublicKey, req.BandwidthLimit); err != nil {
+	if err := updatePeerBandwidthLimit(req.PublicKey, limit); err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
@@ -1504,7 +1539,7 @@ func handleUpdatePeerBandwidth(w http.ResponseWriter, r *http.Request) {
 // updatePeerBandwidthLimit changes the traffic-shaping rate/ceil for an existing peer, identified by
 // public key, to limit. It looks up the peer's current AllowedIPs from WireGuard rather than trusting
 // the caller with IPs directly, since the caller only has authority over the peer's bandwidth policy.
-func updatePeerBandwidthLimit(publicKey string, limit string) error {
+func updatePeerBandwidthLimit(publicKey string, limit shapingLimit) error {
 	if !doTrafficShaping {
 		return fmt.Errorf("traffic shaping is not enabled on this gerbil instance")
 	}
