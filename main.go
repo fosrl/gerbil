@@ -659,10 +659,10 @@ func main() {
 		logger.Fatal("Failed to ensure WireGuard interface: %v", err)
 	}
 
-	// Set up IFB device for bidirectional ingress/egress traffic shaping if enabled
+	// Set up the egress qdisc and IFB device for bidirectional traffic shaping if enabled
 	if doTrafficShaping {
-		if err := ensureIFBDevice(); err != nil {
-			logger.Fatal("Failed to ensure IFB device for traffic shaping: %v", err)
+		if err := initTrafficShaping(); err != nil {
+			logger.Fatal("Failed to initialize traffic shaping: %v", err)
 		}
 	}
 
@@ -1303,6 +1303,7 @@ func addPeerInternal(peer Peer) error {
 	// parse allowed IPs into array of net.IPNet
 	var allowedIPs []net.IPNet
 	var wgIPs []string
+	var shapedPrefixes []string
 	for _, ipStr := range peer.AllowedIPs {
 		logger.Debug("Parsing AllowedIP: %s", ipStr)
 		_, ipNet, err := net.ParseCIDR(ipStr)
@@ -1314,6 +1315,7 @@ func addPeerInternal(peer Peer) error {
 		// Extract the IP address from the CIDR for relay cleanup
 		extractedIP := ipNet.IP.String()
 		wgIPs = append(wgIPs, extractedIP)
+		shapedPrefixes = append(shapedPrefixes, ipNet.String())
 		logger.Debug("Extracted IP %s from AllowedIP %s", extractedIP, ipStr)
 	}
 
@@ -1337,10 +1339,10 @@ func addPeerInternal(peer Peer) error {
 		if peer.BandwidthLimit != "" {
 			limit = peer.BandwidthLimit
 		}
-		logger.Debug("doTrafficShaping is true, setting up bandwidth limits (%s) for %d IPs", limit, len(wgIPs))
-		for _, wgIP := range wgIPs {
-			if err := setupPeerBandwidthLimit(wgIP, limit); err != nil {
-				logger.Warn("Failed to setup bandwidth limit for peer IP %s: %v", wgIP, err)
+		logger.Debug("doTrafficShaping is true, setting up bandwidth limits (%s) for %d prefixes", limit, len(shapedPrefixes))
+		for _, prefix := range shapedPrefixes {
+			if err := setupPeerBandwidthLimit(prefix, limit); err != nil {
+				logger.Warn("Failed to setup bandwidth limit for %s: %v", prefix, err)
 			}
 		}
 	} else {
@@ -1404,6 +1406,7 @@ func removePeerInternal(publicKey string) error {
 
 	// Get current peer info before removing to clear relay connections and bandwidth limits
 	var wgIPs []string
+	var shapedPrefixes []string
 	allowedIPsCount := 0
 	device, err := wgClient.Device(interfaceName)
 	if err == nil {
@@ -1413,6 +1416,7 @@ func removePeerInternal(publicKey string) error {
 				// Extract WireGuard IPs from this peer's allowed IPs
 				for _, allowedIP := range peer.AllowedIPs {
 					wgIPs = append(wgIPs, allowedIP.IP.String())
+					shapedPrefixes = append(shapedPrefixes, allowedIP.String())
 				}
 				break
 			}
@@ -1434,9 +1438,9 @@ func removePeerInternal(publicKey string) error {
 
 	// Remove bandwidth limits for each peer IP
 	if doTrafficShaping {
-		for _, wgIP := range wgIPs {
-			if err := removePeerBandwidthLimit(wgIP); err != nil {
-				logger.Warn("Failed to remove bandwidth limit for peer IP %s: %v", wgIP, err)
+		for _, prefix := range shapedPrefixes {
+			if err := removePeerBandwidthLimit(prefix); err != nil {
+				logger.Warn("Failed to remove bandwidth limit for %s: %v", prefix, err)
 			}
 		}
 	}
@@ -1518,13 +1522,13 @@ func updatePeerBandwidthLimit(publicKey string, limit string) error {
 		return fmt.Errorf("failed to get device: %v", err)
 	}
 
-	var wgIPs []string
+	var shapedPrefixes []string
 	found := false
 	for _, peer := range device.Peers {
 		if peer.PublicKey == pubKey {
 			found = true
 			for _, allowedIP := range peer.AllowedIPs {
-				wgIPs = append(wgIPs, allowedIP.IP.String())
+				shapedPrefixes = append(shapedPrefixes, allowedIP.String())
 			}
 			break
 		}
@@ -1533,9 +1537,9 @@ func updatePeerBandwidthLimit(publicKey string, limit string) error {
 		return fmt.Errorf("peer not found: %s", publicKey)
 	}
 
-	for _, wgIP := range wgIPs {
-		if err := setupPeerBandwidthLimit(wgIP, limit); err != nil {
-			return fmt.Errorf("failed to update bandwidth limit for peer IP %s: %v", wgIP, err)
+	for _, prefix := range shapedPrefixes {
+		if err := setupPeerBandwidthLimit(prefix, limit); err != nil {
+			return fmt.Errorf("failed to update bandwidth limit for %s: %v", prefix, err)
 		}
 	}
 
@@ -1935,328 +1939,4 @@ func monitorMemory(limit uint64, heapDir string) {
 		}
 		time.Sleep(5 * time.Second)
 	}
-}
-
-// ensureIFBDevice creates and configures the IFB (Intermediate Functional Block) device used to
-// shape ingress traffic on the WireGuard interface. Linux TC qdiscs only control egress by default;
-// the IFB trick redirects all ingress packets to a virtual device so HTB shaping can be applied
-// there, and the packets are transparently re-injected into the kernel network stack afterwards.
-// This is completely invisible to sockets/applications (including a reverse proxy on the host).
-func ensureIFBDevice() error {
-	// Check if the ifb kernel module is loaded (works inside containers too)
-	if _, err := os.Stat("/sys/module/ifb"); os.IsNotExist(err) {
-		logger.Warn("IFB module not loaded, skipping IFB setup and ingress traffic shaping")
-		return nil
-	}
-
-	// Create the IFB device if it does not already exist
-	_, err := netlink.LinkByName(ifbName)
-	if err != nil {
-		if _, ok := err.(netlink.LinkNotFoundError); ok {
-			cmd := exec.Command("ip", "link", "add", ifbName, "type", "ifb")
-			if out, err := cmd.CombinedOutput(); err != nil {
-				return fmt.Errorf("failed to create IFB device %s: %v, output: %s", ifbName, err, string(out))
-			}
-			logger.Info("Created IFB device %s", ifbName)
-		} else {
-			return fmt.Errorf("failed to look up IFB device %s: %v", ifbName, err)
-		}
-	} else {
-		logger.Info("IFB device %s already exists", ifbName)
-	}
-
-	// Bring the IFB device up
-	cmd := exec.Command("ip", "link", "set", "dev", ifbName, "up")
-	if out, err := cmd.CombinedOutput(); err != nil {
-		return fmt.Errorf("failed to bring up IFB device %s: %v, output: %s", ifbName, err, string(out))
-	}
-
-	// Attach an ingress qdisc to the WireGuard interface if one is not already present
-	cmd = exec.Command("tc", "qdisc", "show", "dev", interfaceName)
-	out, err := cmd.CombinedOutput()
-	if err != nil {
-		return fmt.Errorf("failed to query qdiscs on %s: %v", interfaceName, err)
-	}
-	if !strings.Contains(string(out), "ingress") {
-		cmd = exec.Command("tc", "qdisc", "add", "dev", interfaceName, "handle", "ffff:", "ingress")
-		if out, err := cmd.CombinedOutput(); err != nil {
-			return fmt.Errorf("failed to add ingress qdisc to %s: %v, output: %s", interfaceName, err, string(out))
-		}
-		logger.Info("Added ingress qdisc to %s", interfaceName)
-	}
-
-	// Add a catch-all filter that redirects every ingress packet from wg0 to the IFB device.
-	// Per-peer rate limiting then happens on ifb0's egress HTB qdisc (handle 2:).
-	cmd = exec.Command("tc", "filter", "show", "dev", interfaceName, "parent", "ffff:")
-	out, err = cmd.CombinedOutput()
-	if err != nil || !strings.Contains(string(out), ifbName) {
-		cmd = exec.Command("tc", "filter", "add", "dev", interfaceName,
-			"parent", "ffff:", "protocol", "ip",
-			"u32", "match", "u32", "0", "0",
-			"action", "mirred", "egress", "redirect", "dev", ifbName)
-		if out, err := cmd.CombinedOutput(); err != nil {
-			return fmt.Errorf("failed to add ingress redirect filter on %s: %v, output: %s", interfaceName, err, string(out))
-		}
-		logger.Info("Added ingress redirect filter: %s -> %s", interfaceName, ifbName)
-	}
-
-	// Ensure an HTB root qdisc exists on the IFB device (handle 2:) for per-peer shaping
-	cmd = exec.Command("tc", "qdisc", "show", "dev", ifbName)
-	out, err = cmd.CombinedOutput()
-	if err != nil {
-		return fmt.Errorf("failed to query qdiscs on %s: %v", ifbName, err)
-	}
-	if !strings.Contains(string(out), "htb") {
-		cmd = exec.Command("tc", "qdisc", "add", "dev", ifbName, "root", "handle", "2:", "htb", "default", "9999")
-		if out, err := cmd.CombinedOutput(); err != nil {
-			return fmt.Errorf("failed to add HTB qdisc to %s: %v, output: %s", ifbName, err, string(out))
-		}
-		logger.Info("Added HTB root qdisc (handle 2:) to IFB device %s", ifbName)
-	}
-
-	logger.Info("IFB device %s ready for ingress traffic shaping", ifbName)
-	return nil
-}
-
-// tcDeleteFiltersByFlowID removes any tc filters on dev/parent whose flowid matches flowID. Used to
-// clear out a peer's previous filter before re-adding it, so that updating a peer's bandwidth limit
-// (which re-adds the filter each time) doesn't accumulate duplicate rules pointing at the same class.
-func tcDeleteFiltersByFlowID(dev, parent, flowID string) {
-	cmd := exec.Command("tc", "filter", "show", "dev", dev, "parent", parent)
-	output, err := cmd.CombinedOutput()
-	if err != nil {
-		logger.Debug("Failed to list filters on %s parent %s: %v, output: %s", dev, parent, err, string(output))
-		return
-	}
-
-	// Filter lines look like:
-	// filter parent 1: protocol ip pref 1 u32 chain 0 fh 800::800 order 2048 key ht 800 bkt 0 flowid 1:4
-	lines := strings.Split(string(output), "\n")
-	for _, line := range lines {
-		if !strings.Contains(line, "flowid "+flowID) || !strings.Contains(line, "fh ") {
-			continue
-		}
-		parts := strings.Fields(line)
-		var handle string
-		for j, part := range parts {
-			if part == "fh" && j+1 < len(parts) {
-				handle = parts[j+1]
-				break
-			}
-		}
-		if handle == "" {
-			continue
-		}
-		delCmd := exec.Command("tc", "filter", "del", "dev", dev, "parent", parent, "handle", handle, "prio", "1", "u32")
-		if delOutput, delErr := delCmd.CombinedOutput(); delErr != nil {
-			logger.Debug("Failed to delete filter handle %s on %s: %v, output: %s", handle, dev, delErr, string(delOutput))
-		} else {
-			logger.Debug("Deleted filter handle %s on %s", handle, dev)
-		}
-	}
-}
-
-// setupPeerBandwidthLimit sets up TC (Traffic Control) to limit bandwidth for a specific peer IP
-// to the given limit (e.g. "50mbit", "1gbit"). Calling this again for an IP that already has a
-// class configured replaces the existing rate, which is how per-peer limits are updated at runtime.
-func setupPeerBandwidthLimit(peerIP string, limit string) error {
-	logger.Debug("setupPeerBandwidthLimit called for peer IP: %s with limit %s", peerIP, limit)
-
-	// Parse the IP to get just the IP address (strip any CIDR notation if present)
-	ip := peerIP
-	if strings.Contains(peerIP, "/") {
-		parsedIP, _, err := net.ParseCIDR(peerIP)
-		if err != nil {
-			return fmt.Errorf("failed to parse peer IP: %v", err)
-		}
-		ip = parsedIP.String()
-	}
-
-	// First, ensure we have a root qdisc on the interface (HTB - Hierarchical Token Bucket)
-	// Check if qdisc already exists
-	cmd := exec.Command("tc", "qdisc", "show", "dev", interfaceName)
-	output, err := cmd.CombinedOutput()
-	if err != nil {
-		return fmt.Errorf("failed to check qdisc: %v, output: %s", err, string(output))
-	}
-
-	// If no HTB qdisc exists, create one
-	if !strings.Contains(string(output), "htb") {
-		cmd = exec.Command("tc", "qdisc", "add", "dev", interfaceName, "root", "handle", "1:", "htb", "default", "9999")
-		if output, err := cmd.CombinedOutput(); err != nil {
-			return fmt.Errorf("failed to add root qdisc: %v, output: %s", err, string(output))
-		}
-		logger.Info("Created HTB root qdisc on %s", interfaceName)
-	}
-
-	// Generate a unique class ID based on the IP address
-	// We'll use the last octet of the IP as part of the class ID
-	ipParts := strings.Split(ip, ".")
-	if len(ipParts) != 4 {
-		return fmt.Errorf("invalid IPv4 address: %s", ip)
-	}
-	lastOctet := ipParts[3]
-	classID := fmt.Sprintf("1:%s", lastOctet)
-	logger.Debug("Generated class ID %s for peer IP %s", classID, ip)
-
-	// Create a class for this peer with bandwidth limit. If the class already exists (either
-	// because the peer was set up before, or because we're updating an existing limit), replace it.
-	cmd = exec.Command("tc", "class", "replace", "dev", interfaceName, "parent", "1:", "classid", classID,
-		"htb", "rate", limit, "ceil", limit)
-	if output, err := cmd.CombinedOutput(); err != nil {
-		return fmt.Errorf("failed to add/replace class: %v, output: %s", err, string(output))
-	}
-	logger.Debug("Successfully set class %s for peer IP %s to %s", classID, ip, limit)
-
-	// Add a filter to match traffic to this peer IP on wg0 egress (peer's download). Clear any
-	// existing filter for this class first, in case this is an update rather than the first setup.
-	tcDeleteFiltersByFlowID(interfaceName, "1:", classID)
-	cmd = exec.Command("tc", "filter", "add", "dev", interfaceName, "protocol", "ip", "parent", "1:",
-		"prio", "1", "u32", "match", "ip", "dst", ip, "flowid", classID)
-	if output, err := cmd.CombinedOutput(); err != nil {
-		logger.Warn("Failed to add egress filter for peer IP %s: %v, output: %s", ip, err, string(output))
-	}
-
-	// Set up ingress shaping on the IFB device (peer's upload / ingress on wg0).
-	// All wg0 ingress is redirected to ifb0 by ensureIFBDevice; we add a per-peer
-	// class + src filter here so each peer gets its own independent rate limit.
-	ifbClassID := fmt.Sprintf("2:%s", lastOctet)
-
-	// Check if the ifb kernel module is loaded (works inside containers too)
-	if _, err := os.Stat("/sys/module/ifb"); os.IsNotExist(err) {
-		logger.Warn("IFB module not loaded, skipping IFB setup and ingress traffic shaping.")
-		logger.Info("Setup bandwidth limit of %s for peer IP %s (egress class %s, ingress class %s)", limit, ip, classID, ifbClassID)
-		return nil
-	}
-
-	cmd = exec.Command("tc", "class", "replace", "dev", ifbName, "parent", "2:", "classid", ifbClassID,
-		"htb", "rate", limit, "ceil", limit)
-	if output, err := cmd.CombinedOutput(); err != nil {
-		logger.Warn("Failed to add/replace IFB class for peer IP %s: %v, output: %s", ip, err, string(output))
-	} else {
-		logger.Debug("Set IFB class %s for peer IP %s to %s", ifbClassID, ip, limit)
-	}
-
-	tcDeleteFiltersByFlowID(ifbName, "2:", ifbClassID)
-	cmd = exec.Command("tc", "filter", "add", "dev", ifbName, "protocol", "ip", "parent", "2:",
-		"prio", "1", "u32", "match", "ip", "src", ip, "flowid", ifbClassID)
-	if output, err := cmd.CombinedOutput(); err != nil {
-		logger.Warn("Failed to add IFB ingress filter for peer IP %s: %v, output: %s", ip, err, string(output))
-	}
-
-	logger.Info("Setup bandwidth limit of %s for peer IP %s (egress class %s, ingress class %s)", limit, ip, classID, ifbClassID)
-	return nil
-}
-
-// removePeerBandwidthLimit removes TC rules for a specific peer IP
-func removePeerBandwidthLimit(peerIP string) error {
-	// Parse the IP to get just the IP address
-	ip := peerIP
-	if strings.Contains(peerIP, "/") {
-		parsedIP, _, err := net.ParseCIDR(peerIP)
-		if err != nil {
-			return fmt.Errorf("failed to parse peer IP: %v", err)
-		}
-		ip = parsedIP.String()
-	}
-
-	// Generate the class ID based on the IP
-	ipParts := strings.Split(ip, ".")
-	if len(ipParts) != 4 {
-		return fmt.Errorf("invalid IPv4 address: %s", ip)
-	}
-	lastOctet := ipParts[3]
-	classID := fmt.Sprintf("1:%s", lastOctet)
-
-	// Remove filters for this IP
-	// List all filters to find the ones for this class
-	cmd := exec.Command("tc", "filter", "show", "dev", interfaceName, "parent", "1:")
-	output, err := cmd.CombinedOutput()
-	if err != nil {
-		logger.Warn("Failed to list filters for peer IP %s: %v, output: %s", ip, err, string(output))
-	} else {
-		// Parse the output to find filter handles that match this classID
-		// The output format includes lines like:
-		// filter parent 1: protocol ip pref 1 u32 chain 0 fh 800::800 order 2048 key ht 800 bkt 0 flowid 1:4
-		lines := strings.Split(string(output), "\n")
-		for _, line := range lines {
-			// Look for lines containing our flowid (classID)
-			if strings.Contains(line, "flowid "+classID) && strings.Contains(line, "fh ") {
-				// Extract handle (format: fh 800::800)
-				parts := strings.Fields(line)
-				var handle string
-				for j, part := range parts {
-					if part == "fh" && j+1 < len(parts) {
-						handle = parts[j+1]
-						break
-					}
-				}
-				if handle != "" {
-					// Delete this filter using the handle
-					delCmd := exec.Command("tc", "filter", "del", "dev", interfaceName, "parent", "1:", "handle", handle, "prio", "1", "u32")
-					if delOutput, delErr := delCmd.CombinedOutput(); delErr != nil {
-						logger.Debug("Failed to delete filter handle %s for peer IP %s: %v, output: %s", handle, ip, delErr, string(delOutput))
-					} else {
-						logger.Debug("Deleted filter handle %s for peer IP %s", handle, ip)
-					}
-				}
-			}
-		}
-	}
-
-	// Remove the egress class on wg0
-	cmd = exec.Command("tc", "class", "del", "dev", interfaceName, "classid", classID)
-	if output, err := cmd.CombinedOutput(); err != nil {
-		if !strings.Contains(string(output), "No such file or directory") && !strings.Contains(string(output), "Cannot find") {
-			logger.Warn("Failed to remove egress class for peer IP %s: %v, output: %s", ip, err, string(output))
-		}
-	}
-
-	// Remove the ingress class and filters on the IFB device
-	ifbClassID := fmt.Sprintf("2:%s", lastOctet)
-
-	// Check if the ifb kernel module is loaded (works inside containers too)
-	if _, err := os.Stat("/sys/module/ifb"); os.IsNotExist(err) {
-		logger.Warn("IFB module not loaded, skipping IFB setup and ingress traffic shaping")
-		logger.Info("Removed bandwidth limit for peer IP %s (egress class %s, ingress class %s)", ip, classID, ifbClassID)
-		return nil
-	}
-
-	cmd = exec.Command("tc", "filter", "show", "dev", ifbName, "parent", "2:")
-	output, err = cmd.CombinedOutput()
-	if err != nil {
-		logger.Warn("Failed to list IFB filters for peer IP %s: %v, output: %s", ip, err, string(output))
-	} else {
-		lines := strings.Split(string(output), "\n")
-		for _, line := range lines {
-			if strings.Contains(line, "flowid "+ifbClassID) && strings.Contains(line, "fh ") {
-				parts := strings.Fields(line)
-				var handle string
-				for j, part := range parts {
-					if part == "fh" && j+1 < len(parts) {
-						handle = parts[j+1]
-						break
-					}
-				}
-				if handle != "" {
-					delCmd := exec.Command("tc", "filter", "del", "dev", ifbName, "parent", "2:", "handle", handle, "prio", "1", "u32")
-					if delOutput, delErr := delCmd.CombinedOutput(); delErr != nil {
-						logger.Debug("Failed to delete IFB filter handle %s for peer IP %s: %v, output: %s", handle, ip, delErr, string(delOutput))
-					} else {
-						logger.Debug("Deleted IFB filter handle %s for peer IP %s", handle, ip)
-					}
-				}
-			}
-		}
-	}
-
-	cmd = exec.Command("tc", "class", "del", "dev", ifbName, "classid", ifbClassID)
-	if output, err := cmd.CombinedOutput(); err != nil {
-		if !strings.Contains(string(output), "No such file or directory") && !strings.Contains(string(output), "Cannot find") {
-			logger.Warn("Failed to remove IFB class for peer IP %s: %v, output: %s", ip, err, string(output))
-		}
-	}
-
-	logger.Info("Removed bandwidth limit for peer IP %s (egress class %s, ingress class %s)", ip, classID, ifbClassID)
-	return nil
 }
