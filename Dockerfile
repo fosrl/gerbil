@@ -19,7 +19,7 @@ RUN CGO_ENABLED=0 GOOS=linux go build -o /gerbil
 # Start a new stage from scratch
 FROM alpine:3.24 AS runner
 
-RUN apk add --no-cache iptables iproute2
+RUN apk add --no-cache iptables iproute2 wireguard-tools
 
 COPY --from=builder /gerbil /usr/local/bin/
 COPY entrypoint.sh /

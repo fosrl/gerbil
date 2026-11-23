@@ -2,6 +2,7 @@ package main
 
 import (
 	"net/netip"
+	"strings"
 	"testing"
 )
 
@@ -138,5 +139,69 @@ filter protocol ip pref 9 u32 chain 0 fh 801::800 order 2048 key ht 801 bkt 0 fl
 	}
 	if got := parseTCFiltersForFlowID(out, "2:0"); len(got) != 0 {
 		t.Errorf("flowid 2:0 should match nothing, got %v", got)
+	}
+}
+
+func TestNewShapingLimit(t *testing.T) {
+	cases := []struct {
+		rate, burst string
+		wantErr     bool
+		wantArgs    string
+	}{
+		{rate: "8mbit", wantArgs: "htb rate 8mbit ceil 8mbit"},
+		{rate: "4mbit", burst: "4mb", wantArgs: "htb rate 4mbit ceil 4mbit burst 4mb cburst 4mb"},
+		{rate: "8mbit", burst: "1600", wantArgs: "htb rate 8mbit ceil 8mbit burst 1600 cburst 1600"},
+		{rate: "1mbit", burst: "32m", wantArgs: "htb rate 1mbit ceil 1mbit burst 32m cburst 32m"}, // ~268s, tc accepts
+		{rate: "1mbit", burst: "33m", wantErr: true},                                              // ~277s, tc rejects
+		{rate: "100kbit", burst: "4mb", wantErr: true},
+		{rate: "8mbit", burst: "100b", wantErr: true}, // smaller than a packet
+		{rate: "8mbit", burst: "4mbit", wantErr: true},
+		{rate: "8mbit", burst: "lots", wantErr: true},
+		{rate: "0mbit", wantErr: true},
+		{rate: "8mbps", wantErr: true},
+		{rate: "", wantErr: true},
+	}
+	for _, c := range cases {
+		got, err := newShapingLimit(c.rate, c.burst)
+		if c.wantErr {
+			if err == nil {
+				t.Errorf("newShapingLimit(%q, %q) = %v, want error", c.rate, c.burst, got)
+			}
+			continue
+		}
+		if err != nil {
+			t.Errorf("newShapingLimit(%q, %q) error: %v", c.rate, c.burst, err)
+			continue
+		}
+		if args := strings.Join(got.htbArgs(), " "); args != c.wantArgs {
+			t.Errorf("newShapingLimit(%q, %q) args = %q, want %q", c.rate, c.burst, args, c.wantArgs)
+		}
+	}
+}
+
+func TestResolvePeerShapingLimitDefaults(t *testing.T) {
+	oldLimit, oldBurst := bandwidthLimit, bandwidthBurst
+	t.Cleanup(func() { bandwidthLimit, bandwidthBurst = oldLimit, oldBurst })
+	bandwidthLimit, bandwidthBurst = "4mbit", "4mb"
+
+	cases := []struct{ rate, burst, want string }{
+		{"", "", "4mbit burst 4mb"},
+		{"50mbit", "", "50mbit burst 4mb"},
+		{"", "512kb", "4mbit burst 512kb"},
+		{"50mbit", "16mb", "50mbit burst 16mb"},
+	}
+	for _, c := range cases {
+		got, err := resolvePeerShapingLimit(c.rate, c.burst)
+		if err != nil {
+			t.Fatalf("resolvePeerShapingLimit(%q, %q): %v", c.rate, c.burst, err)
+		}
+		if got.String() != c.want {
+			t.Errorf("resolvePeerShapingLimit(%q, %q) = %s, want %s", c.rate, c.burst, got, c.want)
+		}
+	}
+
+	// A peer rate low enough to make the default burst too long to drain is rejected.
+	if _, err := resolvePeerShapingLimit("100kbit", ""); err == nil {
+		t.Error("expected 100kbit with a 4mb default burst to be rejected")
 	}
 }
